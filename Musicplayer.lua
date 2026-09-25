@@ -18,7 +18,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.2"
+local APP_VERSION = "1.0.4"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -29,10 +29,12 @@ local audioManager = service.getSystemService(Context.AUDIO_SERVICE)
 
 -- Variabel Status Pemutar Media
 local mediaPlayer = sysProps.get("GLOBAL_ADV_MEDIA_PLAYER")
-local nextMediaPlayer = nil -- Pemutar cadangan di muka untuk Gapless (Tanpa Jeda)
+local nextMediaPlayer = nil -- Pemutar cadangan untuk mode Gapless murni
+local fadingOldPlayers = {} -- Penampung aman pemutar lama yang sedang fade-out agar tidak bocor memori
+local isCrossfading = false -- Penanda proses pudar silang sedang berlangsung
 local songList = {}
 local filteredSongs = {}
-local folderList = {} -- Daftar folder musik
+local folderList = {}
 local currentFolderName = "Semua Lagu"
 local currentIndex = tonumber(sysProps.get("GLOBAL_ADV_SONG_INDEX") or "-1")
 local currentSongPath = tostring(sysProps.get("GLOBAL_ADV_SONG_PATH") or "")
@@ -59,18 +61,23 @@ local function formatTime(ms)
   return string.format("%d:%02d", m, s)
 end
 
+-- Ambil batas volume maksimal saat ini (memperhitungkan Ducking)
+local function getCurrentMaxVolume()
+  local isDuckingEnabled = (prefs.getInt("pref_ducking", 0) == 1)
+  if isDuckingEnabled and (isFocusDucked or isRecordingDucked) then
+    return 0.2
+  end
+  return 1.0
+end
+
 -- ============================================================================
 -- PENGATUR VOLUME OTOMATIS (DUCKING SAAT BICARA & REKAM)
 -- ============================================================================
 local function applyVolumeDucking()
   pcall(function()
-    if not mediaPlayer then return end
-    local isDuckingEnabled = (prefs.getInt("pref_ducking", 0) == 1)
-    if isDuckingEnabled and (isFocusDucked or isRecordingDucked) then
-      mediaPlayer.setVolume(0.2, 0.2)
-    else
-      mediaPlayer.setVolume(1.0, 1.0)
-    end
+    if not mediaPlayer or isCrossfading then return end
+    local maxV = getCurrentMaxVolume()
+    mediaPlayer.setVolume(maxV, maxV)
   end)
 end
 
@@ -95,7 +102,7 @@ pcall(function()
 end)
 
 -- ============================================================================
--- FITUR PERIKSA & UNDUH OTOMATIS PEMBARUAN (MURNI LUA STRING BUFFER)
+-- FITUR PERIKSA & UNDUH OTOMATIS PEMBARUAN (TERUJI & AMAN)
 -- ============================================================================
 local function downloadScriptText(targetUrl)
   local u = URL(targetUrl)
@@ -132,8 +139,8 @@ local function isVersionNewer(remote, localVer)
   if not remote or not localVer then return false end
   local rMaj, rMin, rPat = remote:match("(%d+)%.(%d+)%.?(%d*)")
   local lMaj, lMin, lPat = localVer:match("(%d+)%.(%d+)%.?(%d*)")
-  rMaj, rMin, rPat = tonumber(rMaj or 0), tonumber(rMin or 0), tonumber(rPat or 0)
-  lMaj, lMin, lPat = tonumber(lMaj or 0), tonumber(lMin or 0), tonumber(lPat or 0)
+  rMaj, rMin, rPat = tonumber(rMaj) or 0, tonumber(rMin) or 0, tonumber(rPat) or 0
+  lMaj, lMin, lPat = tonumber(lMaj) or 0, tonumber(lMin) or 0, tonumber(lPat) or 0
   if rMaj > lMaj then return true end
   if rMaj == lMaj and rMin > lMin then return true end
   if rMaj == lMaj and rMin == lMin and rPat > lPat then return true end
@@ -164,28 +171,28 @@ local function applyScriptUpdate(newCodeContent, newVersionStr)
   end
 
   local bDone = AlertDialog.Builder(service)
-  bDone.setTitle("Pembaruan Selesai")
   if isSaved then
-    bDone.setMessage("Pembaruan ke versi v" .. newVersionStr .. " berhasil diunduh dan dipasang.\n\nSilakan tutup dan buka ulang pemutar musik untuk menjalankan versi baru.")
+    bDone.setTitle("Pembaruan Selesai")
+    bDone.setMessage("Pembaruan ke versi v" .. newVersionStr .. " berhasil dipasang.\n\nSilakan tutup dan buka ulang pemutar musik untuk menjalankan versi baru.")
+    bDone.setPositiveButton("OKE", DialogInterface.OnClickListener{
+      onClick = function(d, w)
+        pcall(function()
+          if mainDialog then mainDialog.dismiss() end
+          service.speak("Pemutar ditutup. Silakan buka kembali untuk menikmati versi baru.")
+        end)
+      end
+    })
+    pcall(function() service.speak("Pembaruan selesai dipasang. Silakan buka ulang.") end)
   else
-    bDone.setMessage("Pembaruan ke versi v" .. newVersionStr .. " berhasil diunduh.\n\nSilakan buka ulang pemutar musik untuk menerapkan versi baru.")
+    bDone.setTitle("Gagal Memasang")
+    bDone.setMessage("Versi v" .. newVersionStr .. " berhasil diunduh, tetapi gagal menimpa berkas skrip.\n\nPastikan aplikasi memiliki izin penyimpanan.")
+    bDone.setPositiveButton("TUTUP", nil)
+    pcall(function() service.speak("Gagal menyimpan pembaruan skrip.") end)
   end
 
-  bDone.setPositiveButton("OKE", DialogInterface.OnClickListener{
-    onClick = function(d, w)
-      pcall(function()
-        if mainDialog then mainDialog.dismiss() end
-        service.speak("Pemutar ditutup. Silakan buka kembali untuk menikmati versi baru.")
-      end)
-    end
-  })
   local dlgDone = bDone.create()
   dlgDone.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
   dlgDone.show()
-
-  pcall(function()
-    service.speak("Pembaruan selesai diunduh. Silakan buka ulang pemutar musik.")
-  end)
 end
 
 local function checkUpdate()
@@ -208,7 +215,7 @@ local function checkUpdate()
         local ok, result = pcall(function()
           return downloadScriptText(u)
         end)
-        if ok and result and #result > 100 then
+        if ok and result and #result > 100 and result:find("APP_VERSION") then
           isSuccess = true
           remoteCode = result
           break
@@ -223,27 +230,29 @@ local function checkUpdate()
         run = function()
           if isSuccess and remoteCode then
             local remoteVersion = remoteCode:match('APP_VERSION%s*=%s*["\']([^"\']+)["\']')
-            local vRemote = remoteVersion or "Terbaru"
 
-            if remoteVersion and isVersionNewer(remoteVersion, APP_VERSION) then
+            if not remoteVersion then
+              pcall(function() service.speak("Gagal membaca struktur versi dari server.") end)
+              return
+            end
+
+            if isVersionNewer(remoteVersion, APP_VERSION) then
               local bUp = AlertDialog.Builder(service)
               bUp.setTitle("Versi Baru Tersedia")
-              bUp.setMessage("Versi yang digunakan saat ini: v" .. APP_VERSION .. "\nVersi terbaru yang tersedia: v" .. vRemote .. "\n\nApakah Anda ingin memperbarui sekarang?")
-              
+              bUp.setMessage("Versi saat ini: v" .. APP_VERSION .. "\nVersi terbaru: v" .. remoteVersion .. "\n\nApakah Anda ingin memperbarui sekarang?")
               bUp.setPositiveButton("PERBARUI", DialogInterface.OnClickListener{
                 onClick = function(d, w)
                   pcall(function()
-                    service.speak("Mengunduh pembaruan skrip...")
-                    applyScriptUpdate(remoteCode, vRemote)
+                    service.speak("Menerapkan pembaruan skrip...")
+                    applyScriptUpdate(remoteCode, remoteVersion)
                   end)
                 end
               })
-
               bUp.setNegativeButton("BATAL", nil)
               local dlgUp = bUp.create()
               dlgUp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
               dlgUp.show()
-              pcall(function() service.speak("Versi baru v" .. vRemote .. " tersedia. Versi saat ini v" .. APP_VERSION) end)
+              pcall(function() service.speak("Versi baru v" .. remoteVersion .. " tersedia.") end)
             else
               local bUp = AlertDialog.Builder(service)
               bUp.setTitle("Pemeriksaan Versi")
@@ -267,6 +276,8 @@ end
 -- ============================================================================
 -- PEMINDAI BERKAS AUDIO & PENGELOMPOKAN FOLDER
 -- ============================================================================
+local prepareNextTrackGapless = nil
+
 local function scanAudioFiles(dir, list, pathSet, depth)
   depth = depth or 0
   if depth > 12 then return end
@@ -300,7 +311,7 @@ local function scanAudioFiles(dir, list, pathSet, depth)
 end
 
 local function performScan(silent)
-  songList = {}
+  local tempSongList = {}
   local pathSet = {}
 
   pcall(function()
@@ -317,7 +328,7 @@ local function performScan(silent)
               local lower = f.getName():lower()
               if lower:find("%.mp3$") or lower:find("%.m4a$") or lower:find("%.wav$") or lower:find("%.ogg$") or lower:find("%.flac$") or lower:find("%.aac$") or lower:find("%.opus$") then
                 pathSet[p] = true
-                table.insert(songList, p)
+                table.insert(tempSongList, p)
               end
             end
           end
@@ -370,19 +381,17 @@ local function performScan(silent)
   for _, p in ipairs(pathsToScan) do
     local f = File(p)
     if f.exists() then
-      scanAudioFiles(f, songList, pathSet, 0)
+      scanAudioFiles(f, tempSongList, pathSet, 0)
     end
   end
 
-  table.sort(songList, function(a, b)
+  table.sort(tempSongList, function(a, b)
     return File(a).getName():lower() < File(b).getName():lower()
   end)
 
-  filteredSongs = songList
-
-  folderList = {}
+  local tempFolderList = {}
   local folderMap = {}
-  for _, p in ipairs(songList) do
+  for _, p in ipairs(tempSongList) do
     local parent = File(p).getParent()
     if parent then
       if not folderMap[parent] then
@@ -392,20 +401,28 @@ local function performScan(silent)
           path = parent,
           songs = {}
         }
-        table.insert(folderList, folderMap[parent])
+        table.insert(tempFolderList, folderMap[parent])
       end
       table.insert(folderMap[parent].songs, p)
     end
   end
 
-  table.sort(folderList, function(a, b)
+  table.sort(tempFolderList, function(a, b)
     return a.name:lower() < b.name:lower()
   end)
 
-  for _, fData in ipairs(folderList) do
+  for _, fData in ipairs(tempFolderList) do
     table.sort(fData.songs, function(a, b)
       return File(a).getName():lower() < File(b).getName():lower()
     end)
+  end
+
+  songList = tempSongList
+  filteredSongs = songList
+  folderList = tempFolderList
+
+  if prepareNextTrackGapless then
+    prepareNextTrackGapless()
   end
 
   if not silent then
@@ -426,7 +443,7 @@ end
 
 local playTrack = nil
 local applyPitchAndSpeed = nil
-local prepareNextTrackGapless = nil
+local startCrossfadeTo = nil
 
 -- Dialog Atur Nada & Tempo
 local function showPitchSpeedDialog()
@@ -567,7 +584,7 @@ local function showStreamDialog(txtFolderInfo, txtSongTitle)
     onClick = function(d, w)
       local url = tostring(edit.getText()):gsub("%s+", "")
       if url ~= "" then
-        playTrack(url, 0)
+        playTrack(url, 0, true)
         currentFolderName = "Streaming Daring"
         if txtFolderInfo then txtFolderInfo.setText("Sumber: Daring") end
         if txtSongTitle then txtSongTitle.setText("Stream: " .. url) end
@@ -584,7 +601,7 @@ end
 local function showAboutDialog()
   local b = AlertDialog.Builder(service)
   b.setTitle("Tentang Aplikasi")
-  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, acak khusus dalam folder, resume lagu terakhir, transisi Gapless JetAudio, Audio Ducking saat bicara/rekam, Audio FX, dan pembaruan GitHub anti-timeout.")
+  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, acak khusus dalam folder, resume lagu terakhir, transisi Crossfade & Gapless JetAudio, Audio Ducking saat bicara/rekam, Audio FX, pemuatan antarmuka instan tanpa jeda, dan pembaruan GitHub anti-timeout.")
   b.setPositiveButton("Tutup", nil)
   local dlg = b.create()
   dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
@@ -649,7 +666,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
   addSettingSpinner("Efek Gema / Ruang (Echo Sound):", optEcho, "pref_echo", 0)
   addSettingSpinner("Penguat Bass (Bass Boost):", optBass, "pref_bass", 0)
   addSettingSpinner("Transisi Mulus (Crossfade):", optCrossfade, "pref_crossfade", 1)
-  addSettingSpinner("Durasi Crossfade:", optCrossfadeDur, "pref_crossfade_dur", 4)
+  addSettingSpinner("Durasi Crossfade:", optCrossfadeDur, "pref_crossfade_dur", 1)
   addSettingSpinner("Tema Tampilan (Theme):", optTheme, "pref_theme", 0)
 
   local dlg = nil
@@ -718,7 +735,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
 end
 
 -- ============================================================================
--- TAMPILAN UTAMA (RINGKAS & TERTATA)
+-- TAMPILAN UTAMA
 -- ============================================================================
 local layout = LinearLayout(service)
 layout.setOrientation(LinearLayout.VERTICAL)
@@ -762,7 +779,7 @@ local sbProgress = SeekBar(service)
 sbProgress.setMax(100)
 container.addView(sbProgress)
 
--- BARIS 1: KONTROL PUTAR (SEBELUM - MUNDUR - PUTAR - MAJU - LANJUT)
+-- BARIS 1: KONTROL PUTAR
 local rowPlayback = LinearLayout(service)
 rowPlayback.setOrientation(LinearLayout.HORIZONTAL)
 
@@ -793,7 +810,7 @@ rowPlayback.addView(btnForward, makeColLp(1.0))
 rowPlayback.addView(btnNext, makeColLp(1.0))
 container.addView(rowPlayback)
 
--- BARIS 2: FOLDER, DAFTAR LAGU, & PENGULANGAN CEPAT
+-- BARIS 2: FOLDER, DAFTAR LAGU, & PENGULANGAN
 local rowFolderSong = LinearLayout(service)
 rowFolderSong.setOrientation(LinearLayout.HORIZONTAL)
 local btnFolders = Button(service)
@@ -880,12 +897,18 @@ btnRepeat.setOnClickListener(View.OnClickListener{
 })
 
 -- ============================================================================
--- LOGIKA PEMUTAR AUDIO DENGAN PRELOAD & GAPLESS (TANPA JEDA)
+-- LOGIKA TRANSISI: CROSSFADE & GAPLESS JETAUDIO
 -- ============================================================================
 local function getSeekStepMs()
   local steps = {5000, 10000, 15000, 30000}
   local idx = prefs.getInt("pref_seek_step", 1) + 1
   return steps[idx] or 10000
+end
+
+local function getCrossfadeDurMs()
+  local durs = {3000, 5000, 8000, 10000, 12000, 15000}
+  local idx = prefs.getInt("pref_crossfade_dur", 1) + 1
+  return durs[idx] or 5000
 end
 
 local function refreshButtonLabels()
@@ -931,7 +954,7 @@ local function applySleepTimer()
   end
 end
 
--- Aturan Pengulangan & Acak (0: Mati, 1: Acak Folder Saja, 2: Acak Semua Lagu)
+-- Aturan Pengulangan & Acak
 local function getNextTrackIndex()
   if #filteredSongs == 0 then return -1 end
   local repeatMode = prefs.getInt("pref_repeat", 0)
@@ -940,14 +963,12 @@ local function getNextTrackIndex()
   if repeatMode == 1 then
     return currentIndex
   elseif shuffleMode == 1 and #filteredSongs > 1 then
-    -- ACAK DI DALAM FOLDER SAJA
     local r = math.random(1, #filteredSongs)
     if r == currentIndex and #filteredSongs > 1 then
       r = (currentIndex % #filteredSongs) + 1
     end
     return r
   elseif shuffleMode == 2 and #songList > 1 then
-    -- ACAK SEMUA LAGU (LINTAS FOLDER)
     local r = math.random(1, #songList)
     local targetSong = songList[r]
     for i, p in ipairs(filteredSongs) do
@@ -966,8 +987,44 @@ local function getNextTrackIndex()
   end
 end
 
+-- Eksekutor Pudar Suara Halus (Volume Fader)
+local function fadeVolume(player, startVol, targetVol, durationMs, callback)
+  if not player then
+    if callback then callback() end
+    return
+  end
+  local interval = 50
+  local steps = math.max(1, math.floor(durationMs / interval))
+  local stepTime = math.max(10, math.floor(durationMs / steps))
+  local currentStep = 0
+  local diff = targetVol - startVol
+
+  local r
+  r = Runnable{
+    run = function()
+      currentStep = currentStep + 1
+      local progress = currentStep / steps
+      if progress > 1 then progress = 1 end
+      local v = startVol + (diff * progress)
+      pcall(function()
+        if player then
+          player.setVolume(v, v)
+        end
+      end)
+      if currentStep < steps then
+        mainHandler.postDelayed(r, stepTime)
+      else
+        if callback then callback() end
+      end
+    end
+  }
+  pcall(function() player.setVolume(startVol, startVol) end)
+  mainHandler.post(r)
+end
+
 local attachCompletionListener = nil
 
+-- Persiapan Pemutar Lagu Berikutnya (Gapless vs Crossfade Mode)
 prepareNextTrackGapless = function()
   pcall(function()
     if nextMediaPlayer then
@@ -976,6 +1033,14 @@ prepareNextTrackGapless = function()
     end
 
     if not mediaPlayer or #filteredSongs == 0 then return end
+
+    local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
+
+    if isCrossfadeOn then
+      pcall(function() mediaPlayer.setNextMediaPlayer(nil) end)
+      sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
+      return
+    end
 
     local nextIdx = getNextTrackIndex()
     if nextIdx > 0 and filteredSongs[nextIdx] then
@@ -995,52 +1060,156 @@ prepareNextTrackGapless = function()
   end)
 end
 
+-- Listener Selesai Putar Lagu
 attachCompletionListener = function(player)
   player.setOnCompletionListener(luajava.bindClass("android.media.MediaPlayer$OnCompletionListener"){
     onCompletion = function(mp)
       pcall(function()
-        -- Reset posisi resume lagu saat lagu selesai diputar normal
+        if player ~= mediaPlayer then
+          pcall(function() mp.release() end)
+          return
+        end
+
         prefs.edit().putInt("last_played_pos", 0).apply()
 
-        local nextIdx = tonumber(sysProps.get("GLOBAL_ADV_NEXT_INDEX") or "-1")
-        if nextMediaPlayer and nextIdx and nextIdx > 0 and filteredSongs[nextIdx] then
-          pcall(function() mp.release() end)
-          mediaPlayer = nextMediaPlayer
-          nextMediaPlayer = nil
-          currentIndex = nextIdx
-          currentSongPath = filteredSongs[currentIndex]
+        local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
+        if not isCrossfadeOn then
+          local nextIdx = tonumber(sysProps.get("GLOBAL_ADV_NEXT_INDEX") or "-1")
+          if nextMediaPlayer and nextIdx and nextIdx > 0 and filteredSongs[nextIdx] then
+            pcall(function() mp.release() end)
+            mediaPlayer = nextMediaPlayer
+            nextMediaPlayer = nil
+            currentIndex = nextIdx
+            currentSongPath = filteredSongs[currentIndex]
 
-          sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
-          sysProps.put("GLOBAL_ADV_SONG_PATH", currentSongPath)
-          sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
-          prefs.edit().putString("last_played_path", currentSongPath).apply()
+            sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
+            sysProps.put("GLOBAL_ADV_SONG_PATH", currentSongPath)
+            sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
+            prefs.edit().putString("last_played_path", currentSongPath).apply()
 
-          txtSongTitle.setText(File(currentSongPath).getName())
-          applyPitchAndSpeed()
-          applyVolumeDucking()
-          attachCompletionListener(mediaPlayer)
-          prepareNextTrackGapless()
-        else
-          local nIdx = getNextTrackIndex()
-          if nIdx > 0 and filteredSongs[nIdx] then
-            currentIndex = nIdx
-            playTrack(filteredSongs[currentIndex], 0)
-          else
-            isPlaying = false
-            btnPlay.setText("PUTAR")
+            txtSongTitle.setText(File(currentSongPath).getName())
+            applyPitchAndSpeed()
+            applyVolumeDucking()
+            attachCompletionListener(mediaPlayer)
+            prepareNextTrackGapless()
+            return
           end
+        end
+
+        local nIdx = getNextTrackIndex()
+        if nIdx > 0 and filteredSongs[nIdx] then
+          currentIndex = nIdx
+          playTrack(filteredSongs[currentIndex], 0, true)
+        else
+          isPlaying = false
+          btnPlay.setText("PUTAR")
         end
       end)
     end
   })
 end
 
-playTrack = function(path, startMs)
+-- Mesin Transisi Pudar Silang (Crossfade JetAudio)
+startCrossfadeTo = function(nextPath, nextIdx, durMs)
+  if isCrossfading then return end
+  isCrossfading = true
+
+  local oldPlayer = mediaPlayer
+  local maxVol = getCurrentMaxVolume()
+  local newPlayer = MediaPlayer()
+
+  local okPrep = pcall(function()
+    newPlayer.setDataSource(nextPath)
+    newPlayer.prepare()
+    newPlayer.setVolume(0.0, 0.0)
+    newPlayer.start()
+  end)
+
+  if not okPrep then
+    isCrossfading = false
+    pcall(function() newPlayer.release() end)
+    return
+  end
+
+  mediaPlayer = newPlayer
+  currentIndex = nextIdx
+  currentSongPath = nextPath
+  isPlaying = true
+  btnPlay.setText("JEDA")
+
+  pcall(function()
+    local f = File(nextPath)
+    txtSongTitle.setText(f.getName())
+    local parent = f.getParent()
+    if parent then
+      currentFolderName = File(parent).getName()
+      txtFolderInfo.setText("Folder: " .. currentFolderName)
+    end
+  end)
+
+  sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
+  sysProps.put("GLOBAL_ADV_SONG_PATH", nextPath)
+  sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
+
+  local ed = prefs.edit()
+  ed.putString("last_played_path", nextPath)
+  ed.putInt("last_played_pos", 0)
+  ed.apply()
+
+  applyPitchAndSpeed()
+  applySleepTimer()
+  attachCompletionListener(mediaPlayer)
+
+  -- Fade-In pemutar lagu baru
+  fadeVolume(newPlayer, 0.0, maxVol, durMs, function()
+    isCrossfading = false
+    prepareNextTrackGapless()
+  end)
+
+  -- Fade-Out pemutar lagu lama
+  if oldPlayer then
+    table.insert(fadingOldPlayers, oldPlayer)
+    fadeVolume(oldPlayer, maxVol, 0.0, durMs, function()
+      pcall(function()
+        oldPlayer.stop()
+        oldPlayer.release()
+      end)
+      for idx, p in ipairs(fadingOldPlayers) do
+        if p == oldPlayer then
+          table.remove(fadingOldPlayers, idx)
+          break
+        end
+      end
+    end)
+  end
+end
+
+-- Pemutar Lagu Utama
+playTrack = function(path, startMs, forceImmediate)
+  local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
+  local canCrossfade = not forceImmediate and isPlaying and mediaPlayer and (not startMs or startMs == 0) and isCrossfadeOn
+
+  if canCrossfade then
+    local isStillPlaying = false
+    pcall(function() isStillPlaying = mediaPlayer.isPlaying() end)
+    if isStillPlaying then
+      local cDur = getCrossfadeDurMs()
+      local manualDur = math.min(cDur, 2500)
+      startCrossfadeTo(path, currentIndex, manualDur)
+      return
+    end
+  end
+
   pcall(function()
     if nextMediaPlayer then
       pcall(function() nextMediaPlayer.release() end)
       nextMediaPlayer = nil
     end
+
+    for _, p in ipairs(fadingOldPlayers) do
+      pcall(function() p.stop(); p.release() end)
+    end
+    fadingOldPlayers = {}
 
     if mediaPlayer then
       pcall(function() mediaPlayer.stop(); mediaPlayer.release() end)
@@ -1052,13 +1221,15 @@ playTrack = function(path, startMs)
     mediaPlayer.setDataSource(path)
     mediaPlayer.prepare()
 
-    -- Lanjutkan dari posisi terakhir jika parameter startMs ada
     if startMs and startMs > 0 then
       pcall(function() mediaPlayer.seekTo(startMs) end)
     end
 
+    local maxV = getCurrentMaxVolume()
+    mediaPlayer.setVolume(maxV, maxV)
     mediaPlayer.start()
     isPlaying = true
+    isCrossfading = false
     btnPlay.setText("JEDA")
 
     pcall(function()
@@ -1134,7 +1305,7 @@ pcall(function()
   })
 end)
 
--- Pembaruan Tampilan Real-Time & Perekam Posisi Terakhir (Resume Tracker)
+-- Pembaruan Tampilan Real-Time & Pemicu Otomatis Crossfade
 local isDialogActive = true
 local updateTimerRunnable = nil
 updateTimerRunnable = Runnable{
@@ -1150,7 +1321,18 @@ updateTimerRunnable = Runnable{
           sbProgress.setProgress(math.floor((pos * 100) / dur))
         end
 
-        -- Simpan posisi putar secara otomatis setiap saat untuk fitur resume
+        -- Deteksi batas sisa lagu untuk memulai Crossfade JetAudio
+        local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
+        if isCrossfadeOn and not isCrossfading and not isUserSeeking and dur > 0 then
+          local cDur = getCrossfadeDurMs()
+          if (dur > (cDur * 1.5)) and (dur - pos <= cDur) and (dur - pos > 300) then
+            local nextIdx = getNextTrackIndex()
+            if nextIdx > 0 and filteredSongs[nextIdx] then
+              startCrossfadeTo(filteredSongs[nextIdx], nextIdx, cDur)
+            end
+          end
+        end
+
         if not isUserSeeking and pos > 1000 and (dur - pos > 1500) then
           prefs.edit().putInt("last_played_pos", pos).apply()
         end
@@ -1218,20 +1400,19 @@ btnPlay.setOnClickListener(View.OnClickListener{
       local lastPath = prefs.getString("last_played_path", "")
       local lastPos = prefs.getInt("last_played_pos", 0)
 
-      -- Fitur Lanjutkan Lagu & Posisi Terakhir
       if isResumeActive and lastPath ~= "" and File(lastPath).exists() then
         local foundIdx = 1
         for idx, p in ipairs(filteredSongs) do
           if p == lastPath then foundIdx = idx; break end
         end
         currentIndex = foundIdx
-        playTrack(lastPath, lastPos)
+        playTrack(lastPath, lastPos, true)
         if lastPos > 0 then
           pcall(function() service.speak("Melanjutkan lagu dari posisi " .. formatTime(lastPos)) end)
         end
       elseif #filteredSongs > 0 then
         currentIndex = 1
-        playTrack(filteredSongs[currentIndex], 0)
+        playTrack(filteredSongs[currentIndex], 0, true)
       else
         pcall(function() service.speak("Daftar lagu kosong. Pindai musik terlebih dahulu.") end)
       end
@@ -1460,7 +1641,7 @@ btnLibrary.setOnClickListener(View.OnClickListener{
           local last = prefs.getString("last_played_path", "")
           local lastPos = prefs.getInt("last_played_pos", 0)
           if last ~= "" and File(last).exists() then
-            playTrack(last, lastPos)
+            playTrack(last, lastPos, true)
             if lastPos > 0 then
               pcall(function() service.speak("Melanjutkan dari posisi " .. formatTime(lastPos)) end)
             end
@@ -1502,7 +1683,16 @@ btnLibrary.setOnClickListener(View.OnClickListener{
   end
 })
 
-btnRescan.setOnClickListener(View.OnClickListener{ onClick = function(v) performScan(false) end })
+btnRescan.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    pcall(function() service.speak("Memindai berkas audio...") end)
+    Thread(Runnable{
+      run = function()
+        performScan(false)
+      end
+    }).start()
+  end
+})
 
 btnSettings.setOnClickListener(View.OnClickListener{
   onClick = function(v)
@@ -1535,6 +1725,10 @@ btnExit.setOnClickListener(View.OnClickListener{
         pcall(function() nextMediaPlayer.release() end)
         nextMediaPlayer = nil
       end
+      for _, p in ipairs(fadingOldPlayers) do
+        pcall(function() p.stop(); p.release() end)
+      end
+      fadingOldPlayers = {}
       if mediaPlayer then
         prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply()
         mediaPlayer.stop()
@@ -1554,5 +1748,13 @@ btnExit.setOnClickListener(View.OnClickListener{
   end
 })
 
-performScan(true)
+-- Sinkronisasi status player yang sedang aktif
 syncRunningPlayer()
+
+-- Jalankan pemindaian audio di latar belakang (Background Thread)
+-- agar dialog antarmuka langsung muncul seketika (0 detik) tanpa jeda
+Thread(Runnable{
+  run = function()
+    performScan(true)
+  end
+}).start()
