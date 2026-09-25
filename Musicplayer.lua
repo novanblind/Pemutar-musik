@@ -21,7 +21,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.13"
+local APP_VERSION = "1.0.14"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -82,6 +82,29 @@ local function getCurrentMaxVolume()
     return 0.2
   end
   return 1.0
+end
+
+-- ============================================================================
+-- PENANGAN ERROR MEDIAPLAYER (MENCEGAH PEMUTAR "MACET" SAAT GAGAL)
+-- ============================================================================
+-- Dideklarasikan di awal agar bisa dipasang ke setiap MediaPlayer baru,
+-- termasuk yang dibuat di dalam prepareNextTrackGapless / startCrossfadeTo / playTrack.
+local handleMediaPlayerError = nil -- diisi setelah playTrack & UI utama didefinisikan
+
+local function attachErrorListener(player, label)
+  if not player then return end
+  pcall(function()
+    player.setOnErrorListener(luajava.bindClass("android.media.MediaPlayer$OnErrorListener"){
+      onError = function(mp, what, extra)
+        pcall(function()
+          if handleMediaPlayerError then
+            handleMediaPlayerError(mp, label)
+          end
+        end)
+        return true -- Tandai error sudah ditangani agar tidak memicu callback completion palsu
+      end
+    })
+  end)
 end
 
 -- ============================================================================
@@ -1230,40 +1253,102 @@ local function finishCrossfadeImmediately()
   isCrossfading = false
 end
 
+-- Pemutus rantai darurat: dipanggil saat sebuah MediaPlayer melempar error.
+-- Membersihkan status secara aman per-langkah (bukan satu pcall besar) agar
+-- kontrol (Putar/Jeda/Hentikan) tidak pernah "macet" akibat objek yang rusak.
+handleMediaPlayerError = function(mp, label)
+  pcall(function() service.speak("Terjadi masalah saat memutar berkas audio, melewati ke lagu berikutnya.") end)
+
+  -- Jika yang error adalah pemutar aktif utama
+  if mp == mediaPlayer then
+    pcall(function() mediaPlayer.stop() end)
+    pcall(function() mediaPlayer.release() end)
+    mediaPlayer = nil
+    isPlaying = false
+    isCrossfading = false
+    fadingOldPlayers = {}
+    pcall(function() sysProps.remove("GLOBAL_ADV_MEDIA_PLAYER") end)
+    if btnPlay then pcall(function() btnPlay.setText("PUTAR") end) end
+
+    local nIdx = getNextTrackIndex()
+    if nIdx > 0 and filteredSongs[nIdx] then
+      currentIndex = nIdx
+      if playTrack then playTrack(filteredSongs[currentIndex], 0, true) end
+    end
+    return
+  end
+
+  -- Jika yang error adalah pemutar cadangan (next / gapless siaga)
+  if mp == nextMediaPlayer then
+    pcall(function() nextMediaPlayer.release() end)
+    nextMediaPlayer = nil
+    pcall(function() sysProps.remove("GLOBAL_ADV_NEXT_INDEX") end)
+    if prepareNextTrackGapless then prepareNextTrackGapless() end
+    return
+  end
+
+  -- Jika yang error adalah salah satu pemutar lama yang sedang fade-out
+  for idx, p in ipairs(fadingOldPlayers) do
+    if p == mp then
+      pcall(function() p.stop() end)
+      pcall(function() p.release() end)
+      table.remove(fadingOldPlayers, idx)
+      break
+    end
+  end
+end
+
 -- Persiapan Pemutar Lagu Berikutnya (Selalu Siaga agar Pergantian Otomatis Instan Tanpa Jeda)
 prepareNextTrackGapless = function()
-  pcall(function()
-    if nextMediaPlayer then
-      pcall(function() nextMediaPlayer.release() end)
-      nextMediaPlayer = nil
-    end
+  if nextMediaPlayer then
+    pcall(function() nextMediaPlayer.release() end)
+    nextMediaPlayer = nil
+  end
 
-    if not mediaPlayer or #filteredSongs == 0 then return end
+  if not mediaPlayer or #filteredSongs == 0 then return end
 
-    local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
-    local nextIdx = getNextTrackIndex()
+  local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
+  local nextIdx = getNextTrackIndex()
 
-    if nextIdx > 0 and filteredSongs[nextIdx] then
-      local nextPath = filteredSongs[nextIdx]
-      nextMediaPlayer = MediaPlayer()
-      nextMediaPlayer.setDataSource(nextPath)
-      nextMediaPlayer.prepare()
+  if nextIdx > 0 and filteredSongs[nextIdx] then
+    local nextPath = filteredSongs[nextIdx]
+    local candidate = nil
 
-      if not isCrossfadeOn then
-        pcall(function()
-          mediaPlayer.setNextMediaPlayer(nextMediaPlayer)
-        end)
-      else
-        pcall(function()
-          mediaPlayer.setNextMediaPlayer(nil)
-        end)
-      end
-
-      sysProps.put("GLOBAL_ADV_NEXT_INDEX", tostring(nextIdx))
-    else
+    local okCreate = pcall(function() candidate = MediaPlayer() end)
+    if not okCreate or not candidate then
       sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
+      return
     end
-  end)
+
+    attachErrorListener(candidate, "next")
+
+    local okSrc = pcall(function() candidate.setDataSource(nextPath) end)
+    if not okSrc then
+      pcall(function() candidate.release() end)
+      sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
+      return
+    end
+
+    local okPrep = pcall(function() candidate.prepare() end)
+    if not okPrep then
+      pcall(function() candidate.release() end)
+      sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
+      return
+    end
+
+    -- Baru setelah berhasil sepenuhnya, tetapkan sebagai nextMediaPlayer resmi
+    nextMediaPlayer = candidate
+
+    if not isCrossfadeOn then
+      pcall(function() mediaPlayer.setNextMediaPlayer(nextMediaPlayer) end)
+    else
+      pcall(function() mediaPlayer.setNextMediaPlayer(nil) end)
+    end
+
+    sysProps.put("GLOBAL_ADV_NEXT_INDEX", tostring(nextIdx))
+  else
+    sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
+  end
 end
 
 -- Listener Selesai Putar Lagu (Menyambung Otomatis Tanpa Jeda Saat Lagu Habis)
@@ -1311,6 +1396,7 @@ attachCompletionListener = function(player)
           pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
           applyVolumeDucking()
           attachCompletionListener(mediaPlayer)
+          attachErrorListener(mediaPlayer, "main")
           prepareNextTrackGapless()
           return
         end
@@ -1342,11 +1428,15 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
     newPlayer = nextMediaPlayer
     nextMediaPlayer = nil
   else
-    newPlayer = MediaPlayer()
-    local okPrep = pcall(function()
-      newPlayer.setDataSource(nextPath)
-      newPlayer.prepare()
-    end)
+    local okCreate = pcall(function() newPlayer = MediaPlayer() end)
+    if not okCreate or not newPlayer then
+      isCrossfading = false
+      return
+    end
+    attachErrorListener(newPlayer, "main")
+
+    local okSrc = pcall(function() newPlayer.setDataSource(nextPath) end)
+    local okPrep = okSrc and pcall(function() newPlayer.prepare() end)
     if not okPrep then
       isCrossfading = false
       pcall(function() newPlayer.release() end)
@@ -1354,10 +1444,15 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
     end
   end
 
-  pcall(function()
+  local okStart = pcall(function()
     newPlayer.setVolume(0.0, 0.0)
     newPlayer.start()
   end)
+  if not okStart then
+    isCrossfading = false
+    pcall(function() newPlayer.release() end)
+    return
+  end
 
   mediaPlayer = newPlayer
   currentIndex = nextIdx
@@ -1388,6 +1483,7 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
   pcall(function() applyAudioEffects(newPlayer.getAudioSessionId()) end)
   applySleepTimer()
   attachCompletionListener(mediaPlayer)
+  attachErrorListener(mediaPlayer, "main")
 
   -- Fade-In pemutar lagu baru
   fadeVolume(newPlayer, 0.0, maxVol, durMs, function()
@@ -1431,57 +1527,92 @@ playTrack = function(path, startMs, forceImmediate)
     end
   end
 
+  -- Bersihkan pemutar cadangan & pemutar lama yang sedang fade, per-langkah
+  if nextMediaPlayer then
+    pcall(function() nextMediaPlayer.release() end)
+    nextMediaPlayer = nil
+  end
+
+  for _, p in ipairs(fadingOldPlayers) do
+    pcall(function() p.stop() end)
+    pcall(function() p.release() end)
+  end
+  fadingOldPlayers = {}
+
+  if mediaPlayer then
+    pcall(function() mediaPlayer.stop() end)
+    pcall(function() mediaPlayer.release() end)
+    mediaPlayer = nil
+    pcall(function() sysProps.remove("GLOBAL_ADV_MEDIA_PLAYER") end)
+  end
+
+  local newPlayer = nil
+  local okCreate = pcall(function() newPlayer = MediaPlayer() end)
+  if not okCreate or not newPlayer then
+    pcall(function() service.speak("Gagal menyiapkan pemutar audio.") end)
+    return
+  end
+  attachErrorListener(newPlayer, "main")
+
+  local okSrc = pcall(function() newPlayer.setDataSource(path) end)
+  if not okSrc then
+    pcall(function() newPlayer.release() end)
+    pcall(function() service.speak("Berkas audio tidak dapat dibuka: " .. File(path).getName()) end)
+    return
+  end
+
+  local okPrep = pcall(function() newPlayer.prepare() end)
+  if not okPrep then
+    pcall(function() newPlayer.release() end)
+    pcall(function() service.speak("Gagal memuat berkas audio: " .. File(path).getName()) end)
+    return
+  end
+
+  mediaPlayer = newPlayer
+
+  if startMs and startMs > 0 then
+    pcall(function() mediaPlayer.seekTo(startMs) end)
+  end
+
+  local maxV = getCurrentMaxVolume()
+  pcall(function() mediaPlayer.setVolume(maxV, maxV) end)
+
+  local okStart = pcall(function() mediaPlayer.start() end)
+  if not okStart then
+    pcall(function() mediaPlayer.release() end)
+    mediaPlayer = nil
+    pcall(function() service.speak("Gagal memulai pemutaran audio.") end)
+    return
+  end
+
+  isPlaying = true
+  isCrossfading = false
+  if btnPlay then btnPlay.setText("JEDA") end
+
+  isLoopingAB = false
+  loopA = 0
+  loopB = 0
+
   pcall(function()
-    if nextMediaPlayer then
-      pcall(function() nextMediaPlayer.release() end)
-      nextMediaPlayer = nil
+    if audioManager and audioFocusListener then
+      audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
     end
+  end)
 
-    for _, p in ipairs(fadingOldPlayers) do
-      pcall(function() p.stop(); p.release() end)
-    end
-    fadingOldPlayers = {}
-
-    if mediaPlayer then
-      pcall(function() mediaPlayer.stop(); mediaPlayer.release() end)
-      mediaPlayer = nil
-      sysProps.remove("GLOBAL_ADV_MEDIA_PLAYER")
-    end
-
-    mediaPlayer = MediaPlayer()
-    mediaPlayer.setDataSource(path)
-    mediaPlayer.prepare()
-
-    if startMs and startMs > 0 then
-      pcall(function() mediaPlayer.seekTo(startMs) end)
-    end
-
-    local maxV = getCurrentMaxVolume()
-    mediaPlayer.setVolume(maxV, maxV)
-    mediaPlayer.start()
-    isPlaying = true
-    isCrossfading = false
-    if btnPlay then btnPlay.setText("JEDA") end
-
-    isLoopingAB = false
-    loopA = 0
-    loopB = 0
-
-    pcall(function()
-      if audioManager and audioFocusListener then
-        audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
-      end
-    end)
-
-    currentSongPath = path
+  currentSongPath = path
+  pcall(function()
     local f = File(path)
     if txtSongTitle then txtSongTitle.setText(f.getName()) end
     if txtFolderInfo then txtFolderInfo.setText("Folder: " .. currentFolderName) end
+  end)
 
+  pcall(function()
     sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
     sysProps.put("GLOBAL_ADV_SONG_PATH", path)
     sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
+  end)
 
+  pcall(function()
     local ed = prefs.edit()
     ed.putString("last_played_path", path)
     if startMs and startMs > 0 then
@@ -1490,14 +1621,14 @@ playTrack = function(path, startMs, forceImmediate)
       ed.putInt("last_played_pos", 0)
     end
     ed.apply()
-
-    applyPitchAndSpeed()
-    pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
-    applySleepTimer()
-    applyVolumeDucking()
-    attachCompletionListener(mediaPlayer)
-    prepareNextTrackGapless()
   end)
+
+  pcall(function() applyPitchAndSpeed() end)
+  pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
+  pcall(function() applySleepTimer() end)
+  pcall(function() applyVolumeDucking() end)
+  pcall(function() attachCompletionListener(mediaPlayer) end)
+  pcall(function() prepareNextTrackGapless() end)
 end
 
 -- Listener Geser Durasi (SeekBar)
@@ -1619,6 +1750,7 @@ local function syncRunningPlayer()
         txtFolderInfo.setText("Folder: " .. currentFolderName)
       end
       attachCompletionListener(mediaPlayer)
+      attachErrorListener(mediaPlayer, "main")
       pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
       pcall(function() applyPitchAndSpeed() end)
       prepareNextTrackGapless()
@@ -1657,28 +1789,36 @@ btnPlay.setOnClickListener(View.OnClickListener{
       return
     end
 
-    if mediaPlayer.isPlaying() then
-      mediaPlayer.pause()
+    local isCurrentlyPlaying = false
+    pcall(function() isCurrentlyPlaying = mediaPlayer.isPlaying() end)
+
+    if isCurrentlyPlaying then
+      pcall(function() mediaPlayer.pause() end)
       btnPlay.setText("PUTAR")
       isPlaying = false
+      pcall(function() prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply() end)
       pcall(function()
-        prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply()
         if audioManager and audioFocusListener then
           audioManager.abandonAudioFocus(audioFocusListener)
         end
-        service.speak("Musik dijeda.")
       end)
+      pcall(function() service.speak("Musik dijeda.") end)
     else
-      mediaPlayer.start()
+      local okStart = pcall(function() mediaPlayer.start() end)
+      if not okStart then
+        -- MediaPlayer sudah dalam kondisi rusak; bersihkan dan lanjut ke lagu berikutnya
+        pcall(function() handleMediaPlayerError(mediaPlayer, "main") end)
+        return
+      end
       btnPlay.setText("JEDA")
       isPlaying = true
       pcall(function()
         if audioManager and audioFocusListener then
           audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
         end
-        applyVolumeDucking()
-        service.speak("Musik dilanjutkan.")
       end)
+      pcall(function() applyVolumeDucking() end)
+      pcall(function() service.speak("Musik dilanjutkan.") end)
     end
   end
 })
@@ -2005,32 +2145,44 @@ btnExit.setOnClickListener(View.OnClickListener{
     if updateTimerRunnable then
       mainHandler.removeCallbacks(updateTimerRunnable)
     end
+
+    -- Setiap langkah dibungkus pcall sendiri-sendiri agar satu kegagalan
+    -- (mis. objek MediaPlayer sudah dalam kondisi error) tidak menghalangi
+    -- langkah pembersihan berikutnya. Ini yang membuat tombol HENTIKAN
+    -- dulu bisa "macet" dan musik terus berbunyi.
     pcall(function()
       if audioManager and audioFocusListener then
         audioManager.abandonAudioFocus(audioFocusListener)
       end
-      if nextMediaPlayer then
-        pcall(function() nextMediaPlayer.release() end)
-        nextMediaPlayer = nil
-      end
-      for _, p in ipairs(fadingOldPlayers) do
-        pcall(function() p.stop(); p.release() end)
-      end
-      fadingOldPlayers = {}
-      if mediaPlayer then
-        prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply()
-        mediaPlayer.stop()
-        mediaPlayer.release()
-        mediaPlayer = nil
-      end
-      sysProps.remove("GLOBAL_ADV_MEDIA_PLAYER")
-      sysProps.remove("GLOBAL_ADV_SONG_PATH")
-      sysProps.remove("GLOBAL_ADV_SONG_INDEX")
-      sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
-      cancelSleepTimer()
-      releaseAudioEffects()
-      service.speak("Pemutar musik dihentikan dan ditutup.")
     end)
+
+    if nextMediaPlayer then
+      pcall(function() nextMediaPlayer.release() end)
+      nextMediaPlayer = nil
+    end
+
+    for _, p in ipairs(fadingOldPlayers) do
+      pcall(function() p.stop() end)
+      pcall(function() p.release() end)
+    end
+    fadingOldPlayers = {}
+
+    if mediaPlayer then
+      pcall(function() prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply() end)
+      pcall(function() mediaPlayer.stop() end)
+      pcall(function() mediaPlayer.release() end)
+      mediaPlayer = nil
+    end
+
+    pcall(function() sysProps.remove("GLOBAL_ADV_MEDIA_PLAYER") end)
+    pcall(function() sysProps.remove("GLOBAL_ADV_SONG_PATH") end)
+    pcall(function() sysProps.remove("GLOBAL_ADV_SONG_INDEX") end)
+    pcall(function() sysProps.remove("GLOBAL_ADV_NEXT_INDEX") end)
+
+    pcall(function() cancelSleepTimer() end)
+    pcall(function() releaseAudioEffects() end)
+    pcall(function() service.speak("Pemutar musik dihentikan dan ditutup.") end)
+
     mainDialog.dismiss()
   end
 })
