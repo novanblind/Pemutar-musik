@@ -18,7 +18,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.4"
+local APP_VERSION = "1.0.5"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -35,7 +35,8 @@ local isCrossfading = false -- Penanda proses pudar silang sedang berlangsung
 local songList = {}
 local filteredSongs = {}
 local folderList = {}
-local currentFolderName = "Semua Lagu"
+local currentFolderPath = prefs.getString("last_folder_path", "")
+local currentFolderName = prefs.getString("last_folder_name", "Semua Lagu")
 local currentIndex = tonumber(sysProps.get("GLOBAL_ADV_SONG_INDEX") or "-1")
 local currentSongPath = tostring(sysProps.get("GLOBAL_ADV_SONG_PATH") or "")
 local isPlaying = false
@@ -274,9 +275,10 @@ local function checkUpdate()
 end
 
 -- ============================================================================
--- PEMINDAI BERKAS AUDIO & PENGELOMPOKAN FOLDER
+-- PEMINDAI BERKAS AUDIO & PENGELOMPOKAN FOLDER KONSISTEN
 -- ============================================================================
 local prepareNextTrackGapless = nil
+local txtFolderInfo = nil
 
 local function scanAudioFiles(dir, list, pathSet, depth)
   depth = depth or 0
@@ -417,19 +419,66 @@ local function performScan(silent)
     end)
   end
 
-  songList = tempSongList
-  filteredSongs = songList
-  folderList = tempFolderList
+  -- Pasang hasil pemindaian di UI Thread dengan mempertahankan folder aktif
+  mainHandler.post(Runnable{
+    run = function()
+      songList = tempSongList
+      folderList = tempFolderList
 
-  if prepareNextTrackGapless then
-    prepareNextTrackGapless()
-  end
+      -- Kunci folder aktif: Jangan tertimpa menjadi seluruh lagu jika sedang memutar folder tertentu
+      if currentFolderPath ~= "" and currentFolderPath ~= "SEARCH" and currentFolderPath ~= "FAVORITES" then
+        local foundFolder = nil
+        for _, f in ipairs(folderList) do
+          if f.path == currentFolderPath then
+            foundFolder = f
+            break
+          end
+        end
 
-  if not silent then
-    pcall(function()
-      service.speak("Pemindaian selesai. Berhasil menemukan " .. #songList .. " lagu di " .. #folderList .. " folder.")
-    end)
-  end
+        if foundFolder then
+          filteredSongs = foundFolder.songs
+          currentFolderName = foundFolder.name
+        else
+          currentFolderPath = ""
+          currentFolderName = "Semua Lagu"
+          filteredSongs = songList
+        end
+      elseif currentFolderPath == "FAVORITES" then
+        -- Pertahankan filter favorit
+      elseif currentFolderPath == "SEARCH" then
+        -- Pertahankan pencarian
+      else
+        currentFolderPath = ""
+        currentFolderName = "Semua Lagu"
+        filteredSongs = songList
+      end
+
+      if txtFolderInfo then
+        txtFolderInfo.setText("Folder: " .. currentFolderName)
+      end
+
+      -- Sinkronkan kembali nomor indeks lagu saat ini di dalam folder aktif
+      if currentSongPath ~= "" then
+        for idx, p in ipairs(filteredSongs) do
+          if p == currentSongPath then
+            currentIndex = idx
+            sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
+            break
+          end
+        end
+      end
+
+      if prepareNextTrackGapless then
+        prepareNextTrackGapless()
+      end
+
+      if not silent then
+        pcall(function()
+          service.speak("Pemindaian selesai. Berhasil menemukan " .. #songList .. " lagu di " .. #folderList .. " folder.")
+        end)
+      end
+    end
+  })
 end
 
 -- ============================================================================
@@ -574,7 +623,7 @@ local function showABLoopDialog()
 end
 
 -- Dialog Streaming Daring
-local function showStreamDialog(txtFolderInfo, txtSongTitle)
+local function showStreamDialog(txtFInfo, txtSTitle)
   local edit = EditText(service)
   edit.setHint("https://.../stream.mp3")
   local b = AlertDialog.Builder(service)
@@ -584,10 +633,11 @@ local function showStreamDialog(txtFolderInfo, txtSongTitle)
     onClick = function(d, w)
       local url = tostring(edit.getText()):gsub("%s+", "")
       if url ~= "" then
-        playTrack(url, 0, true)
+        currentFolderPath = "STREAM"
         currentFolderName = "Streaming Daring"
-        if txtFolderInfo then txtFolderInfo.setText("Sumber: Daring") end
-        if txtSongTitle then txtSongTitle.setText("Stream: " .. url) end
+        playTrack(url, 0, true)
+        if txtFInfo then txtFInfo.setText("Folder: Streaming Daring") end
+        if txtSTitle then txtSTitle.setText("Stream: " .. url) end
       end
     end
   })
@@ -601,7 +651,7 @@ end
 local function showAboutDialog()
   local b = AlertDialog.Builder(service)
   b.setTitle("Tentang Aplikasi")
-  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, acak khusus dalam folder, resume lagu terakhir, transisi Crossfade & Gapless JetAudio, Audio Ducking saat bicara/rekam, Audio FX, pemuatan antarmuka instan tanpa jeda, dan pembaruan GitHub anti-timeout.")
+  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan penguncian folder pemutaran konsisten, kontrol navigasi ringkas, acak khusus dalam folder, resume posisi, transisi Crossfade & Gapless JetAudio, Audio Ducking saat bicara/rekam, Audio FX, pemuatan instan tanpa jeda, dan pembaruan GitHub anti-timeout.")
   b.setPositiveButton("Tutup", nil)
   local dlg = b.create()
   dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
@@ -611,7 +661,7 @@ end
 -- ============================================================================
 -- PENGATURAN (SETTINGS DIALOG)
 -- ============================================================================
-local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle)
+local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   local b = AlertDialog.Builder(service)
   b.setTitle("Pengaturan")
 
@@ -683,7 +733,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
 
   local btnSubStream = Button(service)
   btnSubStream.setText("STREAMING AUDIO DARING")
-  btnSubStream.setOnClickListener(View.OnClickListener{ onClick = function(v) showStreamDialog(txtFolderInfo, txtSongTitle) end })
+  btnSubStream.setOnClickListener(View.OnClickListener{ onClick = function(v) showStreamDialog(txtFInfo, txtSTitle) end })
   box.addView(btnSubStream)
 
   local btnCheckUpdate = Button(service)
@@ -754,7 +804,7 @@ txtTitle.setGravity(Gravity.CENTER)
 txtTitle.setPadding(0, 4, 0, 4)
 container.addView(txtTitle)
 
-local txtFolderInfo = TextView(service)
+txtFolderInfo = TextView(service)
 txtFolderInfo.setText("Folder: " .. currentFolderName)
 txtFolderInfo.setTextSize(13)
 txtFolderInfo.setGravity(Gravity.CENTER)
@@ -954,7 +1004,7 @@ local function applySleepTimer()
   end
 end
 
--- Aturan Pengulangan & Acak
+-- Aturan Pengulangan & Acak (Konsisten Mengikuti Folder)
 local function getNextTrackIndex()
   if #filteredSongs == 0 then return -1 end
   local repeatMode = prefs.getInt("pref_repeat", 0)
@@ -963,24 +1013,29 @@ local function getNextTrackIndex()
   if repeatMode == 1 then
     return currentIndex
   elseif shuffleMode == 1 and #filteredSongs > 1 then
+    -- Acak dalam folder aktif saja
     local r = math.random(1, #filteredSongs)
     if r == currentIndex and #filteredSongs > 1 then
       r = (currentIndex % #filteredSongs) + 1
     end
     return r
   elseif shuffleMode == 2 and #songList > 1 then
+    -- Acak seluruh lagu di memori
     local r = math.random(1, #songList)
     local targetSong = songList[r]
     for i, p in ipairs(filteredSongs) do
       if p == targetSong then return i end
     end
     filteredSongs = songList
+    currentFolderPath = ""
     currentFolderName = "Semua Lagu"
     txtFolderInfo.setText("Folder: Semua Lagu")
     return r
   elseif currentIndex < #filteredSongs then
+    -- Berurutan normal di dalam folder aktif
     return currentIndex + 1
   elseif repeatMode == 2 and #filteredSongs > 0 then
+    -- Ulangi folder dari lagu pertama
     return 1
   else
     return -1
@@ -1140,11 +1195,7 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
   pcall(function()
     local f = File(nextPath)
     txtSongTitle.setText(f.getName())
-    local parent = f.getParent()
-    if parent then
-      currentFolderName = File(parent).getName()
-      txtFolderInfo.setText("Folder: " .. currentFolderName)
-    end
+    txtFolderInfo.setText("Folder: " .. currentFolderName)
   end)
 
   sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
@@ -1241,12 +1292,7 @@ playTrack = function(path, startMs, forceImmediate)
     currentSongPath = path
     local f = File(path)
     txtSongTitle.setText(f.getName())
-
-    local parent = f.getParent()
-    if parent then
-      currentFolderName = File(parent).getName()
-      txtFolderInfo.setText("Folder: " .. currentFolderName)
-    end
+    txtFolderInfo.setText("Folder: " .. currentFolderName)
 
     sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
     sysProps.put("GLOBAL_ADV_SONG_PATH", path)
@@ -1377,11 +1423,7 @@ local function syncRunningPlayer()
       end
       if currentSongPath ~= "" then
         txtSongTitle.setText(File(currentSongPath).getName())
-        local parent = File(currentSongPath).getParent()
-        if parent then
-          currentFolderName = File(parent).getName()
-          txtFolderInfo.setText("Folder: " .. currentFolderName)
-        end
+        txtFolderInfo.setText("Folder: " .. currentFolderName)
       end
       attachCompletionListener(mediaPlayer)
       prepareNextTrackGapless()
@@ -1509,7 +1551,9 @@ local function openFolderDialog()
     onClick = function(d, which)
       if which == 0 then
         filteredSongs = songList
+        currentFolderPath = ""
         currentFolderName = "Semua Folder"
+        prefs.edit().putString("last_folder_path", ""):putString("last_folder_name", "Semua Folder"):apply()
         txtFolderInfo.setText("Folder: Semua Folder")
         pcall(function() service.speak("Memilih semua folder (" .. #songList .. " lagu).") end)
       else
@@ -1524,7 +1568,9 @@ local function openFolderDialog()
         bSub.setItems(songNamesInFolder, DialogInterface.OnClickListener{
           onClick = function(d2, whichSub)
             filteredSongs = selFolder.songs
+            currentFolderPath = selFolder.path
             currentFolderName = selFolder.name
+            prefs.edit().putString("last_folder_path", selFolder.path):putString("last_folder_name", selFolder.name):apply()
             txtFolderInfo.setText("Folder: " .. currentFolderName)
             if whichSub == 0 then
               currentIndex = 1
@@ -1592,8 +1638,9 @@ btnSearch.setOnClickListener(View.OnClickListener{
             table.insert(filteredSongs, p)
           end
         end
+        currentFolderPath = "SEARCH"
         currentFolderName = "Hasil Cari (" .. query .. ")"
-        txtFolderInfo.setText("Pencarian: " .. query)
+        txtFolderInfo.setText("Folder: " .. currentFolderName)
         pcall(function() service.speak("Ditemukan " .. #filteredSongs .. " hasil.") end)
       end
     })
@@ -1607,7 +1654,9 @@ btnSearch.setOnClickListener(View.OnClickListener{
 btnClear.setOnClickListener(View.OnClickListener{
   onClick = function(v)
     filteredSongs = songList
+    currentFolderPath = ""
     currentFolderName = "Semua Lagu"
+    prefs.edit().putString("last_folder_path", ""):putString("last_folder_name", "Semua Lagu"):apply()
     txtFolderInfo.setText("Folder: Semua Lagu")
     pcall(function() service.speak("Menampilkan seluruh lagu.") end)
   end
@@ -1666,6 +1715,7 @@ btnLibrary.setOnClickListener(View.OnClickListener{
             onClick = function(d2, w2)
               filteredSongs = favList
               currentIndex = w2 + 1
+              currentFolderPath = "FAVORITES"
               currentFolderName = "Favorit"
               txtFolderInfo.setText("Folder: Favorit")
               playTrack(filteredSongs[currentIndex], 0)
@@ -1751,8 +1801,7 @@ btnExit.setOnClickListener(View.OnClickListener{
 -- Sinkronisasi status player yang sedang aktif
 syncRunningPlayer()
 
--- Jalankan pemindaian audio di latar belakang (Background Thread)
--- agar dialog antarmuka langsung muncul seketika (0 detik) tanpa jeda
+-- Jalankan pemindaian audio di latar belakang tanpa mengganggu respon antarmuka
 Thread(Runnable{
   run = function()
     performScan(true)
