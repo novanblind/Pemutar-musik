@@ -21,7 +21,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.10"
+local APP_VERSION = "1.0.11"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -46,8 +46,14 @@ local isPlaying = false
 local isLoopingAB = false
 local loopA = 0
 local loopB = 0
-local currentPitch = 1.0
-local currentSpeed = 1.0
+-- Daftar kecepatan putar bersama, dipakai oleh dialog Nada & Tempo maupun spinner di Pengaturan
+-- supaya keduanya selalu sinkron dan sama-sama benar-benar diterapkan ke pemutaran.
+local SPEED_LABELS = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
+local SPEED_VALUES = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}
+-- Nada & kecepatan dimuat dari preferensi tersimpan agar tidak selalu kembali ke 1.0x
+-- setiap skrip dimuat ulang (sebelumnya hilang tiap kali overlay dibuka ulang).
+local currentPitch = prefs.getFloat("pref_pitch_value", 1.0)
+local currentSpeed = SPEED_VALUES[(prefs.getInt("pref_speed", 2)) + 1] or 1.0
 local sleepTimerRunnable = nil
 local isSleepTimerArmed = false -- Penanda agar sleep timer hanya dipasang sekali, bukan direset tiap ganti lagu
 local isUserSeeking = false
@@ -652,6 +658,7 @@ local function showPitchSpeedDialog()
     onClick = function(view)
       currentPitch = math.min(2.0, currentPitch + 0.1)
       applyPitchAndSpeed()
+      pcall(function() prefs.edit().putFloat("pref_pitch_value", currentPitch).apply() end)
       pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
     end
   })
@@ -660,22 +667,21 @@ local function showPitchSpeedDialog()
     onClick = function(view)
       currentPitch = math.max(0.5, currentPitch - 0.1)
       applyPitchAndSpeed()
+      pcall(function() prefs.edit().putFloat("pref_pitch_value", currentPitch).apply() end)
       pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
     end
   })
 
   btnSpeed.setOnClickListener(View.OnClickListener{
     onClick = function(view)
-      local speeds = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
-      local speedVals = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}
       local bSp = AlertDialog.Builder(service)
       bSp.setTitle("Pilih Kecepatan")
-      bSp.setItems(speeds, DialogInterface.OnClickListener{
+      bSp.setItems(SPEED_LABELS, DialogInterface.OnClickListener{
         onClick = function(d, which)
-          currentSpeed = speedVals[which + 1]
+          currentSpeed = SPEED_VALUES[which + 1]
           prefs.edit().putInt("pref_speed", which).apply()
           applyPitchAndSpeed()
-          pcall(function() service.speak("Kecepatan: " .. speeds[which + 1]) end)
+          pcall(function() service.speak("Kecepatan: " .. SPEED_LABELS[which + 1]) end)
         end
       })
       local dlgSp = bSp.create()
@@ -782,7 +788,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   local optShuffle = {"Mati", "Acak Folder Saja", "Acak Semua Lagu"}
   local optRepeat = {"Mati", "Ulangi Lagu Ini", "Ulangi Folder Ini"}
   local optResume = {"Mati", "Hidup"}
-  local optSpeed = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
+  local optSpeed = SPEED_LABELS
   local optDuration = {"5 Detik", "10 Detik", "15 Detik", "30 Detik"}
   local optSleep = {"Mati", "10 Menit", "15 Menit", "30 Menit", "45 Menit", "60 Menit"}
   local optEqualizer = {"Normal", "Hip Hop", "Rock", "Pop", "Jazz", "Klasik"}
@@ -790,7 +796,6 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   local optBass = {"Mati", "Rendah", "Sedang", "Kuat"}
   local optCrossfade = {"Mati", "Hidup"}
   local optCrossfadeDur = {"3 Detik", "5 Detik", "8 Detik", "10 Detik", "12 Detik", "15 Detik"}
-  local optTheme = {"Terang", "Gelap", "Ikuti Sistem"}
   local optDucking = {"Mati", "Hidup"}
 
   local spinners = {}
@@ -826,7 +831,6 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   addSettingSpinner("Penguat Bass (Bass Boost):", optBass, "pref_bass", 0)
   addSettingSpinner("Transisi Mulus (Crossfade):", optCrossfade, "pref_crossfade", 1)
   addSettingSpinner("Durasi Crossfade:", optCrossfadeDur, "pref_crossfade_dur", 1)
-  addSettingSpinner("Tema Tampilan (Theme):", optTheme, "pref_theme", 0)
 
   local dlg = nil
 
@@ -854,10 +858,28 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   btnReset.setText("RESET PENGATURAN")
   btnReset.setOnClickListener(View.OnClickListener{
     onClick = function(v)
-      local ed = prefs.edit()
-      ed.clear()
-      ed.apply()
+      -- Hanya hapus kunci pengaturan pemutar ("pref_*"), agar Favorit, lagu/posisi
+      -- terakhir, dan folder terakhir TIDAK ikut terhapus saat pengguna mereset pengaturan.
+      pcall(function()
+        local ed = prefs.edit()
+        local allEntries = prefs.getAll()
+        if allEntries then
+          local it = allEntries.keySet().iterator()
+          while it.hasNext() do
+            local k = tostring(it.next())
+            if k:find("^pref_") then
+              ed.remove(k)
+            end
+          end
+        end
+        ed.apply()
+      end)
+
+      currentPitch = 1.0
+      currentSpeed = 1.0
+      applyPitchAndSpeed()
       isSleepTimerArmed = false
+
       pcall(function() service.speak("Pengaturan telah direset ke setelan awal.") end)
       if dlg then dlg.dismiss() end
       if onSettingsUpdated then onSettingsUpdated() end
@@ -874,6 +896,17 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
         ed.putInt(k, data.spinner.getSelectedItemPosition())
       end
       ed.apply()
+
+      -- Spinner Kecepatan Putar di Pengaturan sebelumnya hanya tersimpan tanpa pernah
+      -- benar-benar diterapkan ke pemutaran. Sekarang disinkronkan di sini.
+      if spinners["pref_speed"] then
+        local newSpeedIdx = spinners["pref_speed"].spinner.getSelectedItemPosition()
+        local newSpeedVal = SPEED_VALUES[newSpeedIdx + 1]
+        if newSpeedVal then
+          currentSpeed = newSpeedVal
+          applyPitchAndSpeed()
+        end
+      end
 
       -- Sleep timer hanya dipasang ulang jika nilainya benar-benar diubah oleh pengguna di sini
       local newSleepIdx = spinners["pref_sleep_timer"] and spinners["pref_sleep_timer"].spinner.getSelectedItemPosition() or prevSleepIdx
@@ -1601,6 +1634,7 @@ local function syncRunningPlayer()
       end
       attachCompletionListener(mediaPlayer)
       pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
+      pcall(function() applyPitchAndSpeed() end)
       prepareNextTrackGapless()
       applyVolumeDucking()
     end
