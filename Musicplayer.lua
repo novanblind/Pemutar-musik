@@ -9,14 +9,20 @@ import "android.provider.MediaStore"
 import "android.media.MediaPlayer"
 import "android.media.PlaybackParams"
 import "java.io.*"
+import "java.net.URL"
+import "java.net.HttpURLConnection"
+import "java.lang.Thread"
 import "java.lang.Runnable"
 import "java.lang.reflect.Array"
 import "java.lang.System"
+import "android.content.ClipData"
+
+local APP_VERSION = "1.0.1"
+local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
 local PREFS_NAME = "advanced_media_player_id"
 local prefs = service.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-local BACKUP_FILE_PATH = Environment.getExternalStorageDirectory().getAbsolutePath() .. "/advanced_player_backup.cfg"
 local sysProps = System.getProperties()
 
 -- Variabel Status Pemutar Media
@@ -47,7 +53,100 @@ local function formatTime(ms)
 end
 
 -- ============================================================================
--- PEMINDAI BERKAS AUDIO (INTERNAL + KARTU MEMORI / MICROSD) & PENGELOMPOKAN FOLDER
+-- FITUR PERIKSA VERSI BARU (GITHUB)
+-- ============================================================================
+local function checkUpdate()
+  pcall(function() service.speak("Sedang memeriksa versi baru...") end)
+  Thread(Runnable{
+    run = function()
+      local isSuccess = false
+      local remoteVersion = nil
+      local remoteCode = nil
+      local errMsg = ""
+
+      pcall(function()
+        local url = URL(UPDATE_URL)
+        local conn = url.openConnection()
+        conn.setRequestMethod("GET")
+        conn.setConnectTimeout(10000)
+        conn.setReadTimeout(10000)
+        conn.connect()
+        local code = conn.getResponseCode()
+        if code == 200 then
+          local is = conn.getInputStream()
+          local reader = BufferedReader(InputStreamReader(is, "UTF-8"))
+          local sb = java.lang.StringBuilder()
+          local line = reader.readLine()
+          while line ~= nil do
+            sb.append(line):append("\n")
+            line = reader.readLine()
+          end
+          reader.close()
+          is.close()
+          remoteCode = sb.toString()
+          remoteVersion = remoteCode:match('APP_VERSION%s*=%s*"([^"]+)"')
+          isSuccess = true
+        else
+          errMsg = "Kode respons: " .. tostring(code)
+        end
+        conn.disconnect()
+      end)
+
+      mainHandler.post(Runnable{
+        run = function()
+          if isSuccess and remoteCode then
+            local vRemote = remoteVersion or "Terbaru"
+            if remoteVersion and remoteVersion > APP_VERSION then
+              local bUp = AlertDialog.Builder(service)
+              bUp.setTitle("Pembaruan Tersedia")
+              bUp.setMessage("Versi saat ini: v" .. APP_VERSION .. "\nVersi terbaru: v" .. vRemote .. "\n\nVersi baru telah ditemukan di GitHub. Silakan buka halaman repositori atau salin tautan skrip.")
+              bUp.setPositiveButton("Buka Repositori", DialogInterface.OnClickListener{
+                onClick = function(d, w)
+                  pcall(function()
+                    local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/novanblind/Pemutar-musik"))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    service.startActivity(intent)
+                  end)
+                end
+              })
+              bUp.setNeutralButton("Salin Tautan Raw", DialogInterface.OnClickListener{
+                onClick = function(d, w)
+                  pcall(function()
+                    local cm = service.getSystemService(Context.CLIPBOARD_SERVICE)
+                    local cd = ClipData.newPlainText("update_url", UPDATE_URL)
+                    cm.setPrimaryClip(cd)
+                    service.speak("Tautan pembaruan berhasil disalin.")
+                  end)
+                end
+              })
+              bUp.setNegativeButton("Tutup", nil)
+              local dlgUp = bUp.create()
+              dlgUp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+              dlgUp.show()
+              pcall(function() service.speak("Versi baru v" .. vRemote .. " tersedia.") end)
+            else
+              local bUp = AlertDialog.Builder(service)
+              bUp.setTitle("Pemeriksaan Versi")
+              bUp.setMessage("Anda sudah menggunakan versi terbaru (v" .. APP_VERSION .. ").")
+              bUp.setPositiveButton("OK", nil)
+              local dlgUp = bUp.create()
+              dlgUp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+              dlgUp.show()
+              pcall(function() service.speak("Aplikasi sudah versi terbaru v" .. APP_VERSION) end)
+            end
+          else
+            local msg = "Gagal memeriksa versi baru. Periksa koneksi internet."
+            if errMsg ~= "" then msg = msg .. " (" .. errMsg .. ")" end
+            pcall(function() service.speak(msg) end)
+          end
+        end
+      })
+    end
+  }).start()
+end
+
+-- ============================================================================
+-- PEMINDAI BERKAS AUDIO & PENGELOMPOKAN FOLDER
 -- ============================================================================
 local function scanAudioFiles(dir, list, pathSet, depth)
   depth = depth or 0
@@ -162,7 +261,6 @@ local function performScan(silent)
 
   filteredSongs = songList
 
-  -- Kelompokkan lagu berdasarkan folder
   folderList = {}
   local folderMap = {}
   for _, p in ipairs(songList) do
@@ -199,9 +297,186 @@ local function performScan(silent)
 end
 
 -- ============================================================================
--- PENGATURAN (SETTINGS DIALOG)
+-- HELPER TAMPILAN
 -- ============================================================================
-local function showSettingsDialog(onSettingsUpdated)
+local function makeColLp(weight)
+  local lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight or 1.0)
+  lp.setMargins(2, 2, 2, 2)
+  return lp
+end
+
+-- Forward declaration fungsi
+local playTrack = nil
+local applyPitchAndSpeed = nil
+local prepareNextTrackGapless = nil
+
+-- Dialog Atur Nada & Tempo
+local function showPitchSpeedDialog()
+  local b = AlertDialog.Builder(service)
+  b.setTitle("Nada & Kecepatan Putar")
+  local v = LinearLayout(service)
+  v.setOrientation(LinearLayout.VERTICAL)
+  v.setPadding(30, 20, 30, 20)
+
+  local rowP = LinearLayout(service)
+  rowP.setOrientation(LinearLayout.HORIZONTAL)
+  local btnPitchDown = Button(service)
+  btnPitchDown.setText("NADA -")
+  local btnPitchUp = Button(service)
+  btnPitchUp.setText("NADA +")
+  rowP.addView(btnPitchDown, makeColLp(1.0))
+  rowP.addView(btnPitchUp, makeColLp(1.0))
+  v.addView(rowP)
+
+  local btnSpeed = Button(service)
+  btnSpeed.setText("PILIH KECEPATAN (TEMPO)")
+  v.addView(btnSpeed)
+
+  btnPitchUp.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      currentPitch = math.min(2.0, currentPitch + 0.1)
+      applyPitchAndSpeed()
+      pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
+    end
+  })
+
+  btnPitchDown.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      currentPitch = math.max(0.5, currentPitch - 0.1)
+      applyPitchAndSpeed()
+      pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
+    end
+  })
+
+  btnSpeed.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      local speeds = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
+      local speedVals = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}
+      local bSp = AlertDialog.Builder(service)
+      bSp.setTitle("Pilih Kecepatan")
+      bSp.setItems(speeds, DialogInterface.OnClickListener{
+        onClick = function(d, which)
+          currentSpeed = speedVals[which + 1]
+          prefs.edit().putInt("pref_speed", which).apply()
+          applyPitchAndSpeed()
+          pcall(function() service.speak("Kecepatan: " .. speeds[which + 1]) end)
+        end
+      })
+      local dlgSp = bSp.create()
+      dlgSp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+      dlgSp.show()
+    end
+  })
+
+  b.setView(v)
+  b.setPositiveButton("Selesai", nil)
+  local dlg = b.create()
+  dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+  dlg.show()
+end
+
+-- Dialog Pengulangan A-B
+local function showABLoopDialog()
+  local b = AlertDialog.Builder(service)
+  b.setTitle("Pengulangan A-B")
+  local v = LinearLayout(service)
+  v.setOrientation(LinearLayout.VERTICAL)
+  v.setPadding(30, 20, 30, 20)
+
+  local btnLoopStart = Button(service)
+  btnLoopStart.setText("TETAPKAN TITIK AWAL (A)")
+  v.addView(btnLoopStart)
+
+  local btnLoopEnd = Button(service)
+  btnLoopEnd.setText("TETAPKAN TITIK AKHIR (B)")
+  v.addView(btnLoopEnd)
+
+  local btnLoopClear = Button(service)
+  btnLoopClear.setText("HAPUS PENGULANGAN A-B")
+  v.addView(btnLoopClear)
+
+  btnLoopStart.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      pcall(function()
+        if mediaPlayer then
+          loopA = mediaPlayer.getCurrentPosition()
+          service.speak("Titik loop A: " .. formatTime(loopA))
+        end
+      end)
+    end
+  })
+
+  btnLoopEnd.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      pcall(function()
+        if mediaPlayer then
+          loopB = mediaPlayer.getCurrentPosition()
+          if loopB > loopA then
+            isLoopingAB = true
+            service.speak("Titik loop B: " .. formatTime(loopB) .. ". Loop aktif.")
+          else
+            service.speak("Titik B harus lebih besar dari titik A.")
+          end
+        end
+      end)
+    end
+  })
+
+  btnLoopClear.setOnClickListener(View.OnClickListener{
+    onClick = function(view)
+      isLoopingAB = false
+      loopA = 0
+      loopB = 0
+      pcall(function() service.speak("Pengulangan A-B dinonaktifkan.") end)
+    end
+  })
+
+  b.setView(v)
+  b.setPositiveButton("Tutup", nil)
+  local dlg = b.create()
+  dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+  dlg.show()
+end
+
+-- Dialog Streaming Daring
+local function showStreamDialog(txtFolderInfo, txtSongTitle)
+  local edit = EditText(service)
+  edit.setHint("https://.../stream.mp3")
+  local b = AlertDialog.Builder(service)
+  b.setTitle("Streaming Audio Daring")
+  b.setView(edit)
+  b.setPositiveButton("Putar URL", DialogInterface.OnClickListener{
+    onClick = function(d, w)
+      local url = tostring(edit.getText()):gsub("%s+", "")
+      if url ~= "" then
+        playTrack(url)
+        currentFolderName = "Streaming Daring"
+        if txtFolderInfo then txtFolderInfo.setText("Sumber: Daring") end
+        if txtSongTitle then txtSongTitle.setText("Stream: " .. url) end
+      end
+    end
+  })
+  b.setNegativeButton("Batal", nil)
+  local dlg = b.create()
+  dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+  dlg.show()
+end
+
+-- Dialog Tentang Aplikasi
+local function showAboutDialog()
+  local b = AlertDialog.Builder(service)
+  b.setTitle("Tentang Aplikasi")
+  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar berbasis folder, kontrol navigasi ringkas, transisi Gapless JetAudio, Audio FX, dan pembaruan GitHub.")
+  b.setPositiveButton("Tutup", nil)
+  local dlg = b.create()
+  dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+  dlg.show()
+end
+
+-- ============================================================================
+-- PENGATURAN (SETTINGS DIALOG - RINGKAS & LENGKAP)
+-- ============================================================================
+local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle)
   local b = AlertDialog.Builder(service)
   b.setTitle("Pengaturan")
 
@@ -213,7 +488,7 @@ local function showSettingsDialog(onSettingsUpdated)
   box.setPadding(35, 20, 35, 25)
 
   local optShuffle = {"Mati", "Hidup"}
-  local optRepeat = {"Mati", "Ulangi Lagu Ini", "Ulangi Semua"}
+  local optRepeat = {"Mati", "Ulangi Lagu Ini", "Ulangi Folder Ini"}
   local optSpeed = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
   local optDuration = {"5 Detik", "10 Detik", "15 Detik", "30 Detik"}
   local optSleep = {"Mati", "10 Menit", "15 Menit", "30 Menit", "45 Menit", "60 Menit"}
@@ -231,7 +506,7 @@ local function showSettingsDialog(onSettingsUpdated)
     local lbl = TextView(service)
     lbl.setText(labelStr)
     lbl.setTextSize(14)
-    lbl.setPadding(0, 14, 0, 4)
+    lbl.setPadding(0, 12, 0, 4)
     box.addView(lbl)
 
     local sp = Spinner(service)
@@ -259,6 +534,32 @@ local function showSettingsDialog(onSettingsUpdated)
 
   local dlg = nil
 
+  -- Menu Tambahan dalam Setelan
+  local btnSubPitch = Button(service)
+  btnSubPitch.setText("ATUR NADA & TEMPO")
+  btnSubPitch.setOnClickListener(View.OnClickListener{ onClick = function(v) showPitchSpeedDialog() end })
+  box.addView(btnSubPitch)
+
+  local btnSubLoop = Button(service)
+  btnSubLoop.setText("PENGULANGAN A-B (LOOP)")
+  btnSubLoop.setOnClickListener(View.OnClickListener{ onClick = function(v) showABLoopDialog() end })
+  box.addView(btnSubLoop)
+
+  local btnSubStream = Button(service)
+  btnSubStream.setText("STREAMING AUDIO DARING")
+  btnSubStream.setOnClickListener(View.OnClickListener{ onClick = function(v) showStreamDialog(txtFolderInfo, txtSongTitle) end })
+  box.addView(btnSubStream)
+
+  local btnCheckUpdate = Button(service)
+  btnCheckUpdate.setText("PERIKSA VERSI BARU")
+  btnCheckUpdate.setOnClickListener(View.OnClickListener{ onClick = function(v) checkUpdate() end })
+  box.addView(btnCheckUpdate)
+
+  local btnSubAbout = Button(service)
+  btnSubAbout.setText("TENTANG APLIKASI")
+  btnSubAbout.setOnClickListener(View.OnClickListener{ onClick = function(v) showAboutDialog() end })
+  box.addView(btnSubAbout)
+
   local btnReset = Button(service)
   btnReset.setText("RESET PENGATURAN")
   btnReset.setOnClickListener(View.OnClickListener{
@@ -272,58 +573,6 @@ local function showSettingsDialog(onSettingsUpdated)
     end
   })
   box.addView(btnReset)
-
-  local btnBackup = Button(service)
-  btnBackup.setText("BUAT CADANGAN")
-  btnBackup.setOnClickListener(View.OnClickListener{
-    onClick = function(v)
-      pcall(function()
-        local allPrefs = prefs.getAll()
-        local f = File(BACKUP_FILE_PATH)
-        local fos = FileWriter(f)
-        for k, val in pairs(allPrefs) do
-          fos.write(tostring(k) .. "=" .. tostring(val) .. "\n")
-        end
-        fos.close()
-        service.speak("Cadangan pengaturan berhasil disimpan.")
-      end)
-    end
-  })
-  box.addView(btnBackup)
-
-  local btnRestore = Button(service)
-  btnRestore.setText("PULIHKAN CADANGAN")
-  btnRestore.setOnClickListener(View.OnClickListener{
-    onClick = function(v)
-      pcall(function()
-        local f = File(BACKUP_FILE_PATH)
-        if not f.exists() then
-          service.speak("Berkas cadangan tidak ditemukan.")
-          return
-        end
-        local br = BufferedReader(FileReader(f))
-        local ed = prefs.edit()
-        local line = br.readLine()
-        while line ~= nil do
-          local k, val = line:match("^(.-)=(.*)$")
-          if k and val then
-            if tonumber(val) then
-              ed.putInt(k, tonumber(val))
-            else
-              ed.putString(k, val)
-            end
-          end
-          line = br.readLine()
-        end
-        br.close()
-        ed.apply()
-        service.speak("Pengaturan berhasil dipulihkan dari cadangan.")
-        if dlg then dlg.dismiss() end
-        if onSettingsUpdated then onSettingsUpdated() end
-      end)
-    end
-  })
-  box.addView(btnRestore)
 
   local btnClose = Button(service)
   btnClose.setText("TUTUP")
@@ -349,20 +598,11 @@ local function showSettingsDialog(onSettingsUpdated)
 end
 
 -- ============================================================================
--- HELPER TAMPILAN (LAYOUT PARAMS)
--- ============================================================================
-local function makeColLp(weight)
-  local lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight or 1.0)
-  lp.setMargins(4, 4, 4, 4)
-  return lp
-end
-
--- ============================================================================
--- KOMPONEN TAMPILAN UTAMA (UI LEBIH RINGKAS & FOLDER-BASED)
+-- TAMPILAN UTAMA (UI LEBIH RINGKAS & TERFOKUS)
 -- ============================================================================
 local layout = LinearLayout(service)
 layout.setOrientation(LinearLayout.VERTICAL)
-layout.setPadding(24, 16, 24, 20)
+layout.setPadding(20, 12, 20, 16)
 
 local scroll = ScrollView(service)
 scroll.setFillViewport(true)
@@ -374,150 +614,116 @@ local txtTitle = TextView(service)
 txtTitle.setText("Pemutar Musik Folder")
 txtTitle.setTextSize(17)
 txtTitle.setGravity(Gravity.CENTER)
-txtTitle.setPadding(0, 6, 0, 8)
+txtTitle.setPadding(0, 4, 0, 4)
 container.addView(txtTitle)
 
--- Indikator Folder Aktif
+-- Indikator Folder
 local txtFolderInfo = TextView(service)
 txtFolderInfo.setText("Folder: " .. currentFolderName)
 txtFolderInfo.setTextSize(13)
 txtFolderInfo.setGravity(Gravity.CENTER)
-txtFolderInfo.setPadding(0, 0, 0, 4)
+txtFolderInfo.setPadding(0, 0, 0, 2)
 container.addView(txtFolderInfo)
 
 local txtSongTitle = TextView(service)
 txtSongTitle.setText("Tidak ada lagu diputar")
 txtSongTitle.setTextSize(15)
 txtSongTitle.setGravity(Gravity.CENTER)
-txtSongTitle.setPadding(0, 4, 0, 4)
+txtSongTitle.setPadding(0, 2, 0, 2)
 container.addView(txtSongTitle)
 
 local txtTimer = TextView(service)
 txtTimer.setText("0:00 / 0:00")
 txtTimer.setTextSize(13)
 txtTimer.setGravity(Gravity.CENTER)
-txtTimer.setPadding(0, 0, 0, 6)
+txtTimer.setPadding(0, 0, 0, 4)
 container.addView(txtTimer)
 
--- Seekbar
 local sbProgress = SeekBar(service)
 sbProgress.setMax(100)
 container.addView(sbProgress)
 
--- BARIS 1: KONTROL PUTAR (Mundur, PUTAR DI TENGAH, Maju)
+-- BARIS 1: KONTROL PUTAR (SEBELUMNYA - MUNDUR - PUTAR - MAJU - SELANJUTNYA)
 local rowPlayback = LinearLayout(service)
 rowPlayback.setOrientation(LinearLayout.HORIZONTAL)
+
+local btnPrev = Button(service)
+btnPrev.setText("SEBELUM")
+btnPrev.setTextSize(11)
+
 local btnRewind = Button(service)
-btnRewind.setText("MUNDUR 10D")
+btnRewind.setText("MUNDUR")
+btnRewind.setTextSize(11)
+
 local btnPlay = Button(service)
 btnPlay.setText("PUTAR")
-local btnForward = Button(service)
-btnForward.setText("MAJU 10D")
+btnPlay.setTextSize(12)
 
+local btnForward = Button(service)
+btnForward.setText("MAJU")
+btnForward.setTextSize(11)
+
+local btnNext = Button(service)
+btnNext.setText("LANJUT")
+btnNext.setTextSize(11)
+
+rowPlayback.addView(btnPrev, makeColLp(1.0))
 rowPlayback.addView(btnRewind, makeColLp(1.0))
-rowPlayback.addView(btnPlay, makeColLp(1.2)) -- Tombol putar di antara mundur dan maju
+rowPlayback.addView(btnPlay, makeColLp(1.2)) -- Tombol putar berada tepat di tengah mundur dan maju
 rowPlayback.addView(btnForward, makeColLp(1.0))
+rowPlayback.addView(btnNext, makeColLp(1.0))
 container.addView(rowPlayback)
 
--- BARIS 2: NAVIGASI TRACK (Sebelumnya & Selanjutnya)
-local rowTrackNav = LinearLayout(service)
-rowTrackNav.setOrientation(LinearLayout.HORIZONTAL)
-local btnPrev = Button(service)
-btnPrev.setText("SEBELUMNYA")
-local btnNext = Button(service)
-btnNext.setText("SELANJUTNYA")
-rowTrackNav.addView(btnPrev, makeColLp(1.0))
-rowTrackNav.addView(btnNext, makeColLp(1.0))
-container.addView(rowTrackNav)
-
--- BARIS 3: AKSES FOLDER & DAFTAR LAGU
+-- BARIS 2: FOLDER, DAFTAR LAGU, & TOMBOL PENGULANGAN CEPAT
 local rowFolderSong = LinearLayout(service)
 rowFolderSong.setOrientation(LinearLayout.HORIZONTAL)
 local btnFolders = Button(service)
-btnFolders.setText("DAFTAR FOLDER")
+btnFolders.setText("FOLDER")
 local btnSongList = Button(service)
 btnSongList.setText("DAFTAR LAGU")
+local btnRepeat = Button(service)
+btnRepeat.setText("ULANG: MATI")
+
 rowFolderSong.addView(btnFolders, makeColLp(1.0))
 rowFolderSong.addView(btnSongList, makeColLp(1.0))
+rowFolderSong.addView(btnRepeat, makeColLp(1.1))
 container.addView(rowFolderSong)
 
--- BARIS 4: PENCARIAN & RESET
-local rowSearch = LinearLayout(service)
-rowSearch.setOrientation(LinearLayout.HORIZONTAL)
+-- BARIS 3: CARI, SEMUA LAGU, PUSTAKA, & FAVORIT
+local rowLibSearch = LinearLayout(service)
+rowLibSearch.setOrientation(LinearLayout.HORIZONTAL)
 local btnSearch = Button(service)
 btnSearch.setText("CARI")
 local btnClear = Button(service)
-btnClear.setText("SEMUA LAGU")
-rowSearch.addView(btnSearch, makeColLp(1.0))
-rowSearch.addView(btnClear, makeColLp(1.0))
-container.addView(rowSearch)
-
--- BARIS 5: PUSTAKA & FAVORIT
-local rowLibFav = LinearLayout(service)
-rowLibFav.setOrientation(LinearLayout.HORIZONTAL)
+btnClear.setText("SEMUA")
 local btnLibrary = Button(service)
 btnLibrary.setText("PUSTAKA")
 local btnFav = Button(service)
 btnFav.setText("+ FAVORIT")
-rowLibFav.addView(btnLibrary, makeColLp(1.0))
-rowLibFav.addView(btnFav, makeColLp(1.0))
-container.addView(rowLibFav)
 
--- BARIS 6: KONTROL LOOP A-B (Ringkas 3 Kolom)
-local rowAB = LinearLayout(service)
-rowAB.setOrientation(LinearLayout.HORIZONTAL)
-local btnLoopStart = Button(service)
-btnLoopStart.setText("LOOP A")
-local btnLoopEnd = Button(service)
-btnLoopEnd.setText("LOOP B")
-local btnLoopClear = Button(service)
-btnLoopClear.setText("HAPUS LOOP")
-rowAB.addView(btnLoopStart, makeColLp(1.0))
-rowAB.addView(btnLoopEnd, makeColLp(1.0))
-rowAB.addView(btnLoopClear, makeColLp(1.0))
-container.addView(rowAB)
+rowLibSearch.addView(btnSearch, makeColLp(1.0))
+rowLibSearch.addView(btnClear, makeColLp(1.0))
+rowLibSearch.addView(btnLibrary, makeColLp(1.0))
+rowLibSearch.addView(btnFav, makeColLp(1.0))
+container.addView(rowLibSearch)
 
--- BARIS 7: NADA & TEMPO (Ringkas 3 Kolom)
-local rowPitchSpeed = LinearLayout(service)
-rowPitchSpeed.setOrientation(LinearLayout.HORIZONTAL)
-local btnPitchDown = Button(service)
-btnPitchDown.setText("NADA -")
-local btnPitchUp = Button(service)
-btnPitchUp.setText("NADA +")
-local btnSpeed = Button(service)
-btnSpeed.setText("TEMPO")
-rowPitchSpeed.addView(btnPitchDown, makeColLp(1.0))
-rowPitchSpeed.addView(btnPitchUp, makeColLp(1.0))
-rowPitchSpeed.addView(btnSpeed, makeColLp(1.0))
-container.addView(rowPitchSpeed)
-
--- BARIS 8: STREAMING, PINDAI, & PENGATURAN
-local rowTools = LinearLayout(service)
-rowTools.setOrientation(LinearLayout.HORIZONTAL)
-local btnOnlineStream = Button(service)
-btnOnlineStream.setText("STREAM")
+-- BARIS 4: PINDAI, SETELAN, LATAR BELAKANG, & KELUAR
+local rowBottom = LinearLayout(service)
+rowBottom.setOrientation(LinearLayout.HORIZONTAL)
 local btnRescan = Button(service)
 btnRescan.setText("PINDAI")
 local btnSettings = Button(service)
 btnSettings.setText("SETELAN")
-rowTools.addView(btnOnlineStream, makeColLp(1.0))
-rowTools.addView(btnRescan, makeColLp(1.0))
-rowTools.addView(btnSettings, makeColLp(1.0))
-container.addView(rowTools)
-
--- BARIS 9: TENTANG & KELUAR
-local rowExit = LinearLayout(service)
-rowExit.setOrientation(LinearLayout.HORIZONTAL)
-local btnAbout = Button(service)
-btnAbout.setText("TENTANG")
 local btnBackground = Button(service)
-btnBackground.setText("LATAR BELAKANG")
+btnBackground.setText("LATAR")
 local btnExit = Button(service)
 btnExit.setText("HENTIKAN")
-rowExit.addView(btnAbout, makeColLp(1.0))
-rowExit.addView(btnBackground, makeColLp(1.2))
-rowExit.addView(btnExit, makeColLp(1.0))
-container.addView(rowExit)
+
+rowBottom.addView(btnRescan, makeColLp(1.0))
+rowBottom.addView(btnSettings, makeColLp(1.0))
+rowBottom.addView(btnBackground, makeColLp(1.0))
+rowBottom.addView(btnExit, makeColLp(1.0))
+container.addView(rowBottom)
 
 scroll.addView(container)
 layout.addView(scroll)
@@ -529,6 +735,30 @@ local win = mainDialog.getWindow()
 win.setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
 win.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 mainDialog.show()
+
+-- ============================================================================
+-- PENGATURAN STATUS PENGULANGAN (REPEAT)
+-- ============================================================================
+local repeatLabels = {"ULANG: MATI", "ULANG: LAGU", "ULANG: FOLDER"}
+local repeatSpoken = {"Pengulangan mati", "Ulangi lagu ini", "Ulangi folder ini"}
+
+local function updateRepeatButtonUI()
+  local rep = prefs.getInt("pref_repeat", 0)
+  if rep < 0 or rep > 2 then rep = 0 end
+  btnRepeat.setText(repeatLabels[rep + 1])
+end
+updateRepeatButtonUI()
+
+btnRepeat.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    local currentRep = prefs.getInt("pref_repeat", 0)
+    local nextRep = (currentRep + 1) % 3
+    prefs.edit().putInt("pref_repeat", nextRep).apply()
+    updateRepeatButtonUI()
+    pcall(function() service.speak(repeatSpoken[nextRep + 1]) end)
+    prepareNextTrackGapless()
+  end
+})
 
 -- ============================================================================
 -- LOGIKA PEMUTAR AUDIO DENGAN PRELOAD & GAPLESS (TANPA JEDA)
@@ -546,7 +776,7 @@ local function refreshButtonLabels()
 end
 refreshButtonLabels()
 
-local function applyPitchAndSpeed()
+applyPitchAndSpeed = function()
   pcall(function()
     if mediaPlayer and Build.VERSION.SDK_INT >= 23 then
       local params = mediaPlayer.getPlaybackParams()
@@ -582,12 +812,14 @@ local function applySleepTimer()
   end
 end
 
+-- Aturan Pengulangan: 0 = Mati, 1 = Ulangi Lagu Ini, 2 = Ulangi Folder Ini
 local function getNextTrackIndex()
   if #filteredSongs == 0 then return -1 end
   local repeatMode = prefs.getInt("pref_repeat", 0)
   local isShuffle = prefs.getInt("pref_shuffle", 0) == 1
 
   if repeatMode == 1 then
+    -- Ulangi lagu ini
     return currentIndex
   elseif isShuffle and #filteredSongs > 1 then
     local r = math.random(1, #filteredSongs)
@@ -598,15 +830,15 @@ local function getNextTrackIndex()
   elseif currentIndex < #filteredSongs then
     return currentIndex + 1
   elseif repeatMode == 2 and #filteredSongs > 0 then
+    -- Ulangi folder ini (kembali ke nomor 1 dalam folder)
     return 1
   else
+    -- Pengulangan mati: selesai
     return -1
   end
 end
 
 local attachCompletionListener = nil
-local prepareNextTrackGapless = nil
-local playTrack = nil
 
 prepareNextTrackGapless = function()
   pcall(function()
@@ -695,7 +927,6 @@ playTrack = function(path)
     local f = File(path)
     txtSongTitle.setText(f.getName())
 
-    -- Perbarui info folder bila file berada dalam folder lokal
     local parent = f.getParent()
     if parent then
       currentFolderName = File(parent).getName()
@@ -714,7 +945,7 @@ playTrack = function(path)
   end)
 end
 
--- Listener Geser Durasi
+-- Listener Geser Durasi (SeekBar)
 pcall(function()
   local SeekBarChangeListener = luajava.bindClass("android.widget.SeekBar$OnSeekBarChangeListener")
   sbProgress.setOnSeekBarChangeListener(SeekBarChangeListener{
@@ -749,7 +980,7 @@ pcall(function()
   })
 end)
 
--- Timer Pembaruan Tampilan Real-Time
+-- Pembaruan Tampilan Real-Time
 local isDialogActive = true
 local updateTimerRunnable = nil
 updateTimerRunnable = Runnable{
@@ -802,7 +1033,7 @@ local function syncRunningPlayer()
 end
 
 -- ============================================================================
--- PENANGAN KLIK NAVIGASI & FITUR PEMUTAR FOLDER
+-- PENANGAN KLIK KONTROL UTAMA
 -- ============================================================================
 btnPlay.setOnClickListener(View.OnClickListener{
   onClick = function(v)
@@ -873,7 +1104,7 @@ btnForward.setOnClickListener(View.OnClickListener{
   end
 })
 
--- Dialog Pemutar Folder (Fitur Musik Folder)
+-- Dialog Pemilih Folder
 local function openFolderDialog()
   if #folderList == 0 then
     pcall(function() service.speak("Belum ada folder lagu ditemukan. Silakan pindai.") end)
@@ -931,9 +1162,7 @@ local function openFolderDialog()
   dlg.show()
 end
 
-btnFolders.setOnClickListener(View.OnClickListener{
-  onClick = function(v) openFolderDialog() end
-})
+btnFolders.setOnClickListener(View.OnClickListener{ onClick = function(v) openFolderDialog() end })
 
 btnSongList.setOnClickListener(View.OnClickListener{
   onClick = function(v)
@@ -946,7 +1175,7 @@ btnSongList.setOnClickListener(View.OnClickListener{
       table.insert(titles, i .. ". " .. File(p).getName())
     end
     local b = AlertDialog.Builder(service)
-    b.setTitle("Daftar Lagu: " .. currentFolderName .. " (" .. #filteredSongs .. ")")
+    b.setTitle("Daftar: " .. currentFolderName .. " (" .. #filteredSongs .. ")")
     b.setItems(titles, DialogInterface.OnClickListener{
       onClick = function(d, which)
         currentIndex = which + 1
@@ -1064,126 +1293,16 @@ btnLibrary.setOnClickListener(View.OnClickListener{
   end
 })
 
-btnLoopStart.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    pcall(function()
-      if mediaPlayer then
-        loopA = mediaPlayer.getCurrentPosition()
-        service.speak("Titik loop A: " .. formatTime(loopA))
-      end
-    end)
-  end
-})
-
-btnLoopEnd.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    pcall(function()
-      if mediaPlayer then
-        loopB = mediaPlayer.getCurrentPosition()
-        if loopB > loopA then
-          isLoopingAB = true
-          service.speak("Titik loop B: " .. formatTime(loopB) .. ". Loop aktif.")
-        else
-          service.speak("Titik B harus lebih besar dari titik A.")
-        end
-      end
-    end)
-  end
-})
-
-btnLoopClear.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    isLoopingAB = false
-    loopA = 0
-    loopB = 0
-    pcall(function() service.speak("Loop dinonaktifkan.") end)
-  end
-})
-
-btnPitchUp.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    currentPitch = math.min(2.0, currentPitch + 0.1)
-    applyPitchAndSpeed()
-    pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
-  end
-})
-
-btnPitchDown.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    currentPitch = math.max(0.5, currentPitch - 0.1)
-    applyPitchAndSpeed()
-    pcall(function() service.speak(string.format("Nada: %.1fx", currentPitch)) end)
-  end
-})
-
-btnSpeed.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    local speeds = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
-    local speedVals = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}
-    local b = AlertDialog.Builder(service)
-    b.setTitle("Pilih Kecepatan")
-    b.setItems(speeds, DialogInterface.OnClickListener{
-      onClick = function(d, which)
-        currentSpeed = speedVals[which + 1]
-        prefs.edit().putInt("pref_speed", which).apply()
-        applyPitchAndSpeed()
-        pcall(function() service.speak("Kecepatan: " .. speeds[which + 1]) end)
-      end
-    })
-    local dlg = b.create()
-    dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-    dlg.show()
-  end
-})
-
-btnRescan.setOnClickListener(View.OnClickListener{
-  onClick = function(v) performScan(false) end
-})
-
-btnOnlineStream.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    local edit = EditText(service)
-    edit.setHint("https://.../stream.mp3")
-    local b = AlertDialog.Builder(service)
-    b.setTitle("Streaming Audio")
-    b.setView(edit)
-    b.setPositiveButton("Putar URL", DialogInterface.OnClickListener{
-      onClick = function(d, w)
-        local url = tostring(edit.getText()):gsub("%s+", "")
-        if url ~= "" then
-          playTrack(url)
-          currentFolderName = "Streaming Daring"
-          txtFolderInfo.setText("Sumber: Daring")
-          txtSongTitle.setText("Stream: " .. url)
-        end
-      end
-    })
-    b.setNegativeButton("Batal", nil)
-    local dlg = b.create()
-    dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-    dlg.show()
-  end
-})
+btnRescan.setOnClickListener(View.OnClickListener{ onClick = function(v) performScan(false) end })
 
 btnSettings.setOnClickListener(View.OnClickListener{
   onClick = function(v)
     showSettingsDialog(function()
       refreshButtonLabels()
       applySleepTimer()
+      updateRepeatButtonUI()
       prepareNextTrackGapless()
-    end)
-  end
-})
-
-btnAbout.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    local b = AlertDialog.Builder(service)
-    b.setTitle("Tentang Aplikasi")
-    b.setMessage("Pemutar Musik Folder Jieshuo+\n\nVersi pemutar musik berbasis folder lengkap dengan navigasi ringkas, transisi Gapless (Preload tanpa jeda seperti JetAudio), dukungan pemutaran latar belakang, pembacaan kartu memori eksternal, dan Audio FX.")
-    b.setPositiveButton("Tutup", nil)
-    local dlg = b.create()
-    dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-    dlg.show()
+    end, txtFolderInfo, txtSongTitle)
   end
 })
 
