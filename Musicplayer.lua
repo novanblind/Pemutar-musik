@@ -21,7 +21,8 @@ local APP_VERSION = "1.0.1"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
-local PREFS_NAME = "advanced_media_player_id"
+-- Nama SharedPreferences unik khusus skrip ini agar tidak bentrok dengan skrip lain
+local PREFS_NAME = "novan_folder_audio_player_prefs_secure"
 local prefs = service.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 local sysProps = System.getProperties()
 
