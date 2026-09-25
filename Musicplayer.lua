@@ -18,7 +18,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.5"
+local APP_VERSION = "1.0.8"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -46,6 +46,7 @@ local loopB = 0
 local currentPitch = 1.0
 local currentSpeed = 1.0
 local sleepTimerRunnable = nil
+local isSleepTimerArmed = false -- Penanda agar sleep timer hanya dipasang sekali, bukan direset tiap ganti lagu
 local isUserSeeking = false
 local mainDialog = nil
 
@@ -419,7 +420,6 @@ local function performScan(silent)
     end)
   end
 
-  -- Pasang hasil pemindaian di UI Thread dengan mempertahankan folder aktif
   mainHandler.post(Runnable{
     run = function()
       songList = tempSongList
@@ -622,31 +622,6 @@ local function showABLoopDialog()
   dlg.show()
 end
 
--- Dialog Streaming Daring
-local function showStreamDialog(txtFInfo, txtSTitle)
-  local edit = EditText(service)
-  edit.setHint("https://.../stream.mp3")
-  local b = AlertDialog.Builder(service)
-  b.setTitle("Streaming Audio Daring")
-  b.setView(edit)
-  b.setPositiveButton("Putar URL", DialogInterface.OnClickListener{
-    onClick = function(d, w)
-      local url = tostring(edit.getText()):gsub("%s+", "")
-      if url ~= "" then
-        currentFolderPath = "STREAM"
-        currentFolderName = "Streaming Daring"
-        playTrack(url, 0, true)
-        if txtFInfo then txtFInfo.setText("Folder: Streaming Daring") end
-        if txtSTitle then txtSTitle.setText("Stream: " .. url) end
-      end
-    end
-  })
-  b.setNegativeButton("Batal", nil)
-  local dlg = b.create()
-  dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
-  dlg.show()
-end
-
 -- Dialog Tentang Aplikasi
 local function showAboutDialog()
   local b = AlertDialog.Builder(service)
@@ -705,6 +680,8 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
     spinners[prefKey] = { spinner = sp, items = items }
   end
 
+  local prevSleepIdx = prefs.getInt("pref_sleep_timer", 0)
+
   addSettingSpinner("Acak (Shuffle):", optShuffle, "pref_shuffle", 0)
   addSettingSpinner("Pengulangan (Repeat):", optRepeat, "pref_repeat", 0)
   addSettingSpinner("Lanjutkan Posisi Terakhir (Resume):", optResume, "pref_resume", 1)
@@ -731,11 +708,6 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   btnSubLoop.setOnClickListener(View.OnClickListener{ onClick = function(v) showABLoopDialog() end })
   box.addView(btnSubLoop)
 
-  local btnSubStream = Button(service)
-  btnSubStream.setText("STREAMING AUDIO DARING")
-  btnSubStream.setOnClickListener(View.OnClickListener{ onClick = function(v) showStreamDialog(txtFInfo, txtSTitle) end })
-  box.addView(btnSubStream)
-
   local btnCheckUpdate = Button(service)
   btnCheckUpdate.setText("PERIKSA VERSI BARU")
   btnCheckUpdate.setOnClickListener(View.OnClickListener{ onClick = function(v) checkUpdate() end })
@@ -753,6 +725,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
       local ed = prefs.edit()
       ed.clear()
       ed.apply()
+      isSleepTimerArmed = false
       pcall(function() service.speak("Pengaturan telah direset ke setelan awal.") end)
       if dlg then dlg.dismiss() end
       if onSettingsUpdated then onSettingsUpdated() end
@@ -769,6 +742,13 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
         ed.putInt(k, data.spinner.getSelectedItemPosition())
       end
       ed.apply()
+
+      -- Sleep timer hanya dipasang ulang jika nilainya benar-benar diubah oleh pengguna di sini
+      local newSleepIdx = spinners["pref_sleep_timer"] and spinners["pref_sleep_timer"].spinner.getSelectedItemPosition() or prevSleepIdx
+      if newSleepIdx ~= prevSleepIdx then
+        isSleepTimerArmed = false
+      end
+
       applyVolumeDucking()
       if dlg then dlg.dismiss() end
       if onSettingsUpdated then onSettingsUpdated() end
@@ -979,7 +959,11 @@ applyPitchAndSpeed = function()
   end)
 end
 
+-- Sleep timer sekarang hanya dipasang SEKALI per sesi pemutaran (bukan tiap ganti lagu),
+-- supaya durasi yang dipilih pengguna tidak selalu direset dan tidak pernah berbunyi.
 local function applySleepTimer()
+  if isSleepTimerArmed then return end
+
   if sleepTimerRunnable then
     mainHandler.removeCallbacks(sleepTimerRunnable)
     sleepTimerRunnable = nil
@@ -998,10 +982,21 @@ local function applySleepTimer()
           end
           service.speak("Pengatur waktu tidur selesai. Musik dimatikan.")
         end)
+        isSleepTimerArmed = false
       end
     }
     mainHandler.postDelayed(sleepTimerRunnable, min * 60 * 1000)
+    isSleepTimerArmed = true
   end
+end
+
+-- Membatalkan sleep timer secara eksplisit (dipanggil saat berhenti/keluar)
+local function cancelSleepTimer()
+  if sleepTimerRunnable then
+    mainHandler.removeCallbacks(sleepTimerRunnable)
+    sleepTimerRunnable = nil
+  end
+  isSleepTimerArmed = false
 end
 
 -- Aturan Pengulangan & Acak (Konsisten Mengikuti Folder)
@@ -1013,14 +1008,12 @@ local function getNextTrackIndex()
   if repeatMode == 1 then
     return currentIndex
   elseif shuffleMode == 1 and #filteredSongs > 1 then
-    -- Acak dalam folder aktif saja
     local r = math.random(1, #filteredSongs)
     if r == currentIndex and #filteredSongs > 1 then
       r = (currentIndex % #filteredSongs) + 1
     end
     return r
   elseif shuffleMode == 2 and #songList > 1 then
-    -- Acak seluruh lagu di memori
     local r = math.random(1, #songList)
     local targetSong = songList[r]
     for i, p in ipairs(filteredSongs) do
@@ -1030,12 +1023,14 @@ local function getNextTrackIndex()
     currentFolderPath = ""
     currentFolderName = "Semua Lagu"
     txtFolderInfo.setText("Folder: Semua Lagu")
+    local ed = prefs.edit()
+    ed.putString("last_folder_path", "")
+    ed.putString("last_folder_name", "Semua Lagu")
+    ed.apply()
     return r
   elseif currentIndex < #filteredSongs then
-    -- Berurutan normal di dalam folder aktif
     return currentIndex + 1
   elseif repeatMode == 2 and #filteredSongs > 0 then
-    -- Ulangi folder dari lagu pertama
     return 1
   else
     return -1
@@ -1127,6 +1122,11 @@ attachCompletionListener = function(player)
 
         prefs.edit().putInt("last_played_pos", 0).apply()
 
+        -- Loop A-B tidak relevan lagi begitu berpindah ke lagu lain
+        isLoopingAB = false
+        loopA = 0
+        loopB = 0
+
         local isCrossfadeOn = (prefs.getInt("pref_crossfade", 1) == 1)
         if not isCrossfadeOn then
           local nextIdx = tonumber(sysProps.get("GLOBAL_ADV_NEXT_INDEX") or "-1")
@@ -1191,6 +1191,11 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
   currentSongPath = nextPath
   isPlaying = true
   btnPlay.setText("JEDA")
+
+  -- Loop A-B tidak relevan lagi begitu berpindah ke lagu lain
+  isLoopingAB = false
+  loopA = 0
+  loopB = 0
 
   pcall(function()
     local f = File(nextPath)
@@ -1283,6 +1288,11 @@ playTrack = function(path, startMs, forceImmediate)
     isCrossfading = false
     btnPlay.setText("JEDA")
 
+    -- Loop A-B tidak relevan lagi begitu berpindah ke lagu lain
+    isLoopingAB = false
+    loopA = 0
+    loopB = 0
+
     pcall(function()
       if audioManager and audioFocusListener then
         audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
@@ -1297,7 +1307,7 @@ playTrack = function(path, startMs, forceImmediate)
     sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
     sysProps.put("GLOBAL_ADV_SONG_PATH", path)
     sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
-    
+
     local ed = prefs.edit()
     ed.putString("last_played_path", path)
     if startMs and startMs > 0 then
@@ -1417,6 +1427,8 @@ local function syncRunningPlayer()
       if mediaPlayer.isPlaying() then
         isPlaying = true
         btnPlay.setText("JEDA")
+        -- Sudah ada pemutaran berjalan sebelum overlay ini dibuka ulang: anggap sleep timer (jika ada) sudah terpasang
+        isSleepTimerArmed = true
       else
         isPlaying = false
         btnPlay.setText("PUTAR")
@@ -1553,7 +1565,10 @@ local function openFolderDialog()
         filteredSongs = songList
         currentFolderPath = ""
         currentFolderName = "Semua Folder"
-        prefs.edit().putString("last_folder_path", ""):putString("last_folder_name", "Semua Folder"):apply()
+        local ed = prefs.edit()
+        ed.putString("last_folder_path", "")
+        ed.putString("last_folder_name", "Semua Folder")
+        ed.apply()
         txtFolderInfo.setText("Folder: Semua Folder")
         pcall(function() service.speak("Memilih semua folder (" .. #songList .. " lagu).") end)
       else
@@ -1570,7 +1585,10 @@ local function openFolderDialog()
             filteredSongs = selFolder.songs
             currentFolderPath = selFolder.path
             currentFolderName = selFolder.name
-            prefs.edit().putString("last_folder_path", selFolder.path):putString("last_folder_name", selFolder.name):apply()
+            local ed = prefs.edit()
+            ed.putString("last_folder_path", selFolder.path)
+            ed.putString("last_folder_name", selFolder.name)
+            ed.apply()
             txtFolderInfo.setText("Folder: " .. currentFolderName)
             if whichSub == 0 then
               currentIndex = 1
@@ -1656,7 +1674,10 @@ btnClear.setOnClickListener(View.OnClickListener{
     filteredSongs = songList
     currentFolderPath = ""
     currentFolderName = "Semua Lagu"
-    prefs.edit().putString("last_folder_path", ""):putString("last_folder_name", "Semua Lagu"):apply()
+    local ed = prefs.edit()
+    ed.putString("last_folder_path", "")
+    ed.putString("last_folder_name", "Semua Lagu")
+    ed.apply()
     txtFolderInfo.setText("Folder: Semua Lagu")
     pcall(function() service.speak("Menampilkan seluruh lagu.") end)
   end
@@ -1667,7 +1688,14 @@ btnFav.setOnClickListener(View.OnClickListener{
     if currentIndex > 0 and filteredSongs[currentIndex] then
       local path = filteredSongs[currentIndex]
       local currentFavs = prefs.getString("favorite_songs", "")
-      if not currentFavs:find(path, 1, true) then
+      local alreadyFav = false
+      for line in currentFavs:gmatch("[^\r\n]+") do
+        if line == path then
+          alreadyFav = true
+          break
+        end
+      end
+      if not alreadyFav then
         prefs.edit().putString("favorite_songs", currentFavs .. path .. "\n").apply()
         pcall(function() service.speak("Lagu dimasukkan ke Favorit.") end)
       else
@@ -1710,7 +1738,7 @@ btnLibrary.setOnClickListener(View.OnClickListener{
           local favNames = {}
           for idx, p in ipairs(favList) do table.insert(favNames, idx .. ". " .. File(p).getName()) end
           local bFav = AlertDialog.Builder(service)
-          bFav.setTitle("Lagu Favorit")
+          bFav.setTitle("Lagu Favorit (tekan lama untuk hapus)")
           bFav.setItems(favNames, DialogInterface.OnClickListener{
             onClick = function(d2, w2)
               filteredSongs = favList
@@ -1723,6 +1751,28 @@ btnLibrary.setOnClickListener(View.OnClickListener{
           })
           local dlgFav = bFav.create()
           dlgFav.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+
+          -- Tekan-lama sebuah item untuk menghapusnya dari daftar Favorit
+          pcall(function()
+            dlgFav.getListView().setOnItemLongClickListener(luajava.bindClass("android.widget.AdapterView$OnItemLongClickListener"){
+              onItemLongClick = function(parent, itemView, position, id)
+                local removedPath = favList[position + 1]
+                if removedPath then
+                  local newFavsRaw = ""
+                  for _, p in ipairs(favList) do
+                    if p ~= removedPath then
+                      newFavsRaw = newFavsRaw .. p .. "\n"
+                    end
+                  end
+                  prefs.edit().putString("favorite_songs", newFavsRaw).apply()
+                  pcall(function() service.speak("Dihapus dari Favorit: " .. File(removedPath).getName()) end)
+                  dlgFav.dismiss()
+                end
+                return true
+              end
+            })
+          end)
+
           dlgFav.show()
         end
       end
@@ -1789,9 +1839,7 @@ btnExit.setOnClickListener(View.OnClickListener{
       sysProps.remove("GLOBAL_ADV_SONG_PATH")
       sysProps.remove("GLOBAL_ADV_SONG_INDEX")
       sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
-      if sleepTimerRunnable then
-        mainHandler.removeCallbacks(sleepTimerRunnable)
-      end
+      cancelSleepTimer()
       service.speak("Pemutar musik dihentikan dan ditutup.")
     end)
     mainDialog.dismiss()
