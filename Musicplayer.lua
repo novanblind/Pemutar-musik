@@ -42,6 +42,7 @@ local currentPitch = 1.0
 local currentSpeed = 1.0
 local sleepTimerRunnable = nil
 local isUserSeeking = false
+local mainDialog = nil
 
 -- Format Milidetik ke MM:SS
 local function formatTime(ms)
@@ -53,90 +54,168 @@ local function formatTime(ms)
 end
 
 -- ============================================================================
--- FITUR PERIKSA VERSI BARU (GITHUB)
+-- FITUR PERIKSA & UNDUH OTOMATIS PEMBARUAN (MURNI LUA STRING BUFFER)
 -- ============================================================================
+local function downloadScriptText(targetUrl)
+  local u = URL(targetUrl)
+  local conn = u.openConnection()
+  conn.setRequestMethod("GET")
+  conn.setConnectTimeout(15000)
+  conn.setReadTimeout(15000)
+  conn.setUseCaches(false)
+  conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+  conn.setRequestProperty("Accept", "*/*")
+  conn.setRequestProperty("Cache-Control", "no-cache")
+
+  local code = conn.getResponseCode()
+  if code == 200 then
+    local is = conn.getInputStream()
+    local reader = BufferedReader(InputStreamReader(is, "UTF-8"))
+    local lines = {}
+    local line = reader.readLine()
+    while line ~= nil do
+      table.insert(lines, tostring(line))
+      line = reader.readLine()
+    end
+    reader.close()
+    is.close()
+    conn.disconnect()
+    return table.concat(lines, "\n")
+  else
+    conn.disconnect()
+    error("HTTP " .. tostring(code))
+  end
+end
+
+local function isVersionNewer(remote, localVer)
+  if not remote or not localVer then return false end
+  local rMaj, rMin, rPat = remote:match("(%d+)%.(%d+)%.?(%d*)")
+  local lMaj, lMin, lPat = localVer:match("(%d+)%.(%d+)%.?(%d*)")
+  rMaj, rMin, rPat = tonumber(rMaj or 0), tonumber(rMin or 0), tonumber(rPat or 0)
+  lMaj, lMin, lPat = tonumber(lMaj or 0), tonumber(lMin or 0), tonumber(lPat or 0)
+  if rMaj > lMaj then return true end
+  if rMaj == lMaj and rMin > lMin then return true end
+  if rMaj == lMaj and rMin == lMin and rPat > lPat then return true end
+  return false
+end
+
+-- Memasang pembaruan langsung ke berkas aktif
+local function applyScriptUpdate(newCodeContent, newVersionStr)
+  local currentScriptPath = nil
+  pcall(function()
+    local src = debug.getinfo(1, "S").source
+    if src and src:sub(1, 1) == "@" then
+      currentScriptPath = src:sub(2)
+    end
+  end)
+
+  local isSaved = false
+  if currentScriptPath and currentScriptPath ~= "" then
+    pcall(function()
+      local f = File(currentScriptPath)
+      local fos = FileOutputStream(f)
+      local writer = OutputStreamWriter(fos, "UTF-8")
+      writer.write(newCodeContent)
+      writer.flush()
+      writer.close()
+      fos.close()
+      isSaved = true
+    end)
+  end
+
+  local bDone = AlertDialog.Builder(service)
+  bDone.setTitle("Pembaruan Selesai")
+  if isSaved then
+    bDone.setMessage("Pembaruan ke versi v" .. newVersionStr .. " berhasil diunduh dan dipasang.\n\nSilakan tutup dan buka ulang pemutar musik untuk menjalankan versi baru.")
+  else
+    bDone.setMessage("Pembaruan ke versi v" .. newVersionStr .. " berhasil diunduh.\n\nSilakan buka ulang pemutar musik untuk menerapkan versi baru.")
+  end
+
+  bDone.setPositiveButton("OKE", DialogInterface.OnClickListener{
+    onClick = function(d, w)
+      pcall(function()
+        if mainDialog then mainDialog.dismiss() end
+        service.speak("Pemutar ditutup. Silakan buka kembali untuk menikmati versi baru.")
+      end)
+    end
+  })
+  local dlgDone = bDone.create()
+  dlgDone.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+  dlgDone.show()
+
+  pcall(function()
+    service.speak("Pembaruan selesai diunduh. Silakan buka ulang pemutar musik.")
+  end)
+end
+
 local function checkUpdate()
   pcall(function() service.speak("Sedang memeriksa versi baru...") end)
   Thread(Runnable{
     run = function()
       local isSuccess = false
-      local remoteVersion = nil
       local remoteCode = nil
-      local errMsg = ""
+      local lastErrMsg = "Koneksi waktu habis (timeout)"
+      local timeStamp = tostring(System.currentTimeMillis())
 
-      pcall(function()
-        local url = URL(UPDATE_URL)
-        local conn = url.openConnection()
-        conn.setRequestMethod("GET")
-        conn.setConnectTimeout(10000)
-        conn.setReadTimeout(10000)
-        conn.connect()
-        local code = conn.getResponseCode()
-        if code == 200 then
-          local is = conn.getInputStream()
-          local reader = BufferedReader(InputStreamReader(is, "UTF-8"))
-          local sb = java.lang.StringBuilder()
-          local line = reader.readLine()
-          while line ~= nil do
-            sb.append(line):append("\n")
-            line = reader.readLine()
-          end
-          reader.close()
-          is.close()
-          remoteCode = sb.toString()
-          remoteVersion = remoteCode:match('APP_VERSION%s*=%s*"([^"]+)"')
+      local urlsToTry = {
+        "https://fastly.jsdelivr.net/gh/novanblind/Pemutar-musik@main/Musicplayer.lua?t=" .. timeStamp,
+        "https://cdn.jsdelivr.net/gh/novanblind/Pemutar-musik@main/Musicplayer.lua?t=" .. timeStamp,
+        "https://raw.githack.com/novanblind/Pemutar-musik/main/Musicplayer.lua?t=" .. timeStamp,
+        UPDATE_URL .. "?t=" .. timeStamp
+      }
+
+      for _, u in ipairs(urlsToTry) do
+        local ok, result = pcall(function()
+          return downloadScriptText(u)
+        end)
+        if ok and result and #result > 100 then
           isSuccess = true
+          remoteCode = result
+          break
         else
-          errMsg = "Kode respons: " .. tostring(code)
+          if not ok and result then
+            lastErrMsg = tostring(result):gsub(".-:%s*", "")
+          end
         end
-        conn.disconnect()
-      end)
+      end
 
       mainHandler.post(Runnable{
         run = function()
           if isSuccess and remoteCode then
+            local remoteVersion = remoteCode:match('APP_VERSION%s*=%s*["\']([^"\']+)["\']')
             local vRemote = remoteVersion or "Terbaru"
-            if remoteVersion and remoteVersion > APP_VERSION then
+
+            if remoteVersion and isVersionNewer(remoteVersion, APP_VERSION) then
               local bUp = AlertDialog.Builder(service)
-              bUp.setTitle("Pembaruan Tersedia")
-              bUp.setMessage("Versi saat ini: v" .. APP_VERSION .. "\nVersi terbaru: v" .. vRemote .. "\n\nVersi baru telah ditemukan di GitHub. Silakan buka halaman repositori atau salin tautan skrip.")
-              bUp.setPositiveButton("Buka Repositori", DialogInterface.OnClickListener{
+              bUp.setTitle("Versi Baru Tersedia")
+              bUp.setMessage("Versi yang digunakan saat ini: v" .. APP_VERSION .. "\nVersi terbaru yang tersedia: v" .. vRemote .. "\n\nApakah Anda ingin memperbarui sekarang?")
+              
+              bUp.setPositiveButton("PERBARUI", DialogInterface.OnClickListener{
                 onClick = function(d, w)
                   pcall(function()
-                    local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/novanblind/Pemutar-musik"))
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    service.startActivity(intent)
+                    service.speak("Mengunduh pembaruan skrip...")
+                    applyScriptUpdate(remoteCode, vRemote)
                   end)
                 end
               })
-              bUp.setNeutralButton("Salin Tautan Raw", DialogInterface.OnClickListener{
-                onClick = function(d, w)
-                  pcall(function()
-                    local cm = service.getSystemService(Context.CLIPBOARD_SERVICE)
-                    local cd = ClipData.newPlainText("update_url", UPDATE_URL)
-                    cm.setPrimaryClip(cd)
-                    service.speak("Tautan pembaruan berhasil disalin.")
-                  end)
-                end
-              })
-              bUp.setNegativeButton("Tutup", nil)
+
+              bUp.setNegativeButton("BATAL", nil)
               local dlgUp = bUp.create()
               dlgUp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
               dlgUp.show()
-              pcall(function() service.speak("Versi baru v" .. vRemote .. " tersedia.") end)
+              pcall(function() service.speak("Versi baru v" .. vRemote .. " tersedia. Versi saat ini v" .. APP_VERSION) end)
             else
               local bUp = AlertDialog.Builder(service)
               bUp.setTitle("Pemeriksaan Versi")
-              bUp.setMessage("Anda sudah menggunakan versi terbaru (v" .. APP_VERSION .. ").")
-              bUp.setPositiveButton("OK", nil)
+              bUp.setMessage("Aplikasi Anda sudah menggunakan versi terbaru (v" .. APP_VERSION .. ").")
+              bUp.setPositiveButton("OKE", nil)
               local dlgUp = bUp.create()
               dlgUp.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
               dlgUp.show()
               pcall(function() service.speak("Aplikasi sudah versi terbaru v" .. APP_VERSION) end)
             end
           else
-            local msg = "Gagal memeriksa versi baru. Periksa koneksi internet."
-            if errMsg ~= "" then msg = msg .. " (" .. errMsg .. ")" end
+            local msg = "Gagal memeriksa versi baru: " .. lastErrMsg
             pcall(function() service.speak(msg) end)
           end
         end
@@ -305,7 +384,6 @@ local function makeColLp(weight)
   return lp
 end
 
--- Forward declaration fungsi
 local playTrack = nil
 local applyPitchAndSpeed = nil
 local prepareNextTrackGapless = nil
@@ -466,7 +544,7 @@ end
 local function showAboutDialog()
   local b = AlertDialog.Builder(service)
   b.setTitle("Tentang Aplikasi")
-  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar berbasis folder, kontrol navigasi ringkas, transisi Gapless JetAudio, Audio FX, dan pembaruan GitHub.")
+  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, transisi Gapless JetAudio, Audio FX, dan pembaruan GitHub anti-timeout.")
   b.setPositiveButton("Tutup", nil)
   local dlg = b.create()
   dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
@@ -474,7 +552,7 @@ local function showAboutDialog()
 end
 
 -- ============================================================================
--- PENGATURAN (SETTINGS DIALOG - RINGKAS & LENGKAP)
+-- PENGATURAN (SETTINGS DIALOG)
 -- ============================================================================
 local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle)
   local b = AlertDialog.Builder(service)
@@ -534,7 +612,6 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
 
   local dlg = nil
 
-  -- Menu Tambahan dalam Setelan
   local btnSubPitch = Button(service)
   btnSubPitch.setText("ATUR NADA & TEMPO")
   btnSubPitch.setOnClickListener(View.OnClickListener{ onClick = function(v) showPitchSpeedDialog() end })
@@ -598,7 +675,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
 end
 
 -- ============================================================================
--- TAMPILAN UTAMA (UI LEBIH RINGKAS & TERFOKUS)
+-- TAMPILAN UTAMA (RINGKAS & TERTATA)
 -- ============================================================================
 local layout = LinearLayout(service)
 layout.setOrientation(LinearLayout.VERTICAL)
@@ -617,7 +694,6 @@ txtTitle.setGravity(Gravity.CENTER)
 txtTitle.setPadding(0, 4, 0, 4)
 container.addView(txtTitle)
 
--- Indikator Folder
 local txtFolderInfo = TextView(service)
 txtFolderInfo.setText("Folder: " .. currentFolderName)
 txtFolderInfo.setTextSize(13)
@@ -643,7 +719,7 @@ local sbProgress = SeekBar(service)
 sbProgress.setMax(100)
 container.addView(sbProgress)
 
--- BARIS 1: KONTROL PUTAR (SEBELUMNYA - MUNDUR - PUTAR - MAJU - SELANJUTNYA)
+-- BARIS 1: KONTROL PUTAR (SEBELUM - MUNDUR - PUTAR - MAJU - LANJUT)
 local rowPlayback = LinearLayout(service)
 rowPlayback.setOrientation(LinearLayout.HORIZONTAL)
 
@@ -669,12 +745,12 @@ btnNext.setTextSize(11)
 
 rowPlayback.addView(btnPrev, makeColLp(1.0))
 rowPlayback.addView(btnRewind, makeColLp(1.0))
-rowPlayback.addView(btnPlay, makeColLp(1.2)) -- Tombol putar berada tepat di tengah mundur dan maju
+rowPlayback.addView(btnPlay, makeColLp(1.2)) -- Tombol putar di tengah
 rowPlayback.addView(btnForward, makeColLp(1.0))
 rowPlayback.addView(btnNext, makeColLp(1.0))
 container.addView(rowPlayback)
 
--- BARIS 2: FOLDER, DAFTAR LAGU, & TOMBOL PENGULANGAN CEPAT
+-- BARIS 2: FOLDER, DAFTAR LAGU, & PENGULANGAN CEPAT
 local rowFolderSong = LinearLayout(service)
 rowFolderSong.setOrientation(LinearLayout.HORIZONTAL)
 local btnFolders = Button(service)
@@ -730,14 +806,14 @@ layout.addView(scroll)
 
 local dialogBuilder = AlertDialog.Builder(service)
 dialogBuilder.setView(layout)
-local mainDialog = dialogBuilder.create()
+mainDialog = dialogBuilder.create()
 local win = mainDialog.getWindow()
 win.setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
 win.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 mainDialog.show()
 
 -- ============================================================================
--- PENGATURAN STATUS PENGULANGAN (REPEAT)
+-- STATUS PENGULANGAN (REPEAT)
 -- ============================================================================
 local repeatLabels = {"ULANG: MATI", "ULANG: LAGU", "ULANG: FOLDER"}
 local repeatSpoken = {"Pengulangan mati", "Ulangi lagu ini", "Ulangi folder ini"}
@@ -819,7 +895,6 @@ local function getNextTrackIndex()
   local isShuffle = prefs.getInt("pref_shuffle", 0) == 1
 
   if repeatMode == 1 then
-    -- Ulangi lagu ini
     return currentIndex
   elseif isShuffle and #filteredSongs > 1 then
     local r = math.random(1, #filteredSongs)
@@ -830,10 +905,8 @@ local function getNextTrackIndex()
   elseif currentIndex < #filteredSongs then
     return currentIndex + 1
   elseif repeatMode == 2 and #filteredSongs > 0 then
-    -- Ulangi folder ini (kembali ke nomor 1 dalam folder)
     return 1
   else
-    -- Pengulangan mati: selesai
     return -1
   end
 end
