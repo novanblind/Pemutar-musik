@@ -8,6 +8,7 @@ import "android.net.Uri"
 import "android.provider.MediaStore"
 import "android.media.MediaPlayer"
 import "android.media.PlaybackParams"
+import "android.media.AudioManager"
 import "java.io.*"
 import "java.net.URL"
 import "java.net.HttpURLConnection"
@@ -17,14 +18,14 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.1"
+local APP_VERSION = "1.0.2"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
--- Nama SharedPreferences unik khusus skrip ini agar tidak bentrok dengan skrip lain
 local PREFS_NAME = "novan_folder_audio_player_prefs_secure"
 local prefs = service.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 local sysProps = System.getProperties()
+local audioManager = service.getSystemService(Context.AUDIO_SERVICE)
 
 -- Variabel Status Pemutar Media
 local mediaPlayer = sysProps.get("GLOBAL_ADV_MEDIA_PLAYER")
@@ -45,6 +46,10 @@ local sleepTimerRunnable = nil
 local isUserSeeking = false
 local mainDialog = nil
 
+-- Status Ducking (Peredam Audio)
+local isFocusDucked = false
+local isRecordingDucked = false
+
 -- Format Milidetik ke MM:SS
 local function formatTime(ms)
   if not ms or ms < 0 then return "0:00" end
@@ -53,6 +58,41 @@ local function formatTime(ms)
   local s = totalSec % 60
   return string.format("%d:%02d", m, s)
 end
+
+-- ============================================================================
+-- PENGATUR VOLUME OTOMATIS (DUCKING SAAT BICARA & REKAM)
+-- ============================================================================
+local function applyVolumeDucking()
+  pcall(function()
+    if not mediaPlayer then return end
+    local isDuckingEnabled = (prefs.getInt("pref_ducking", 0) == 1)
+    if isDuckingEnabled and (isFocusDucked or isRecordingDucked) then
+      mediaPlayer.setVolume(0.2, 0.2)
+    else
+      mediaPlayer.setVolume(1.0, 1.0)
+    end
+  end)
+end
+
+local audioFocusListener = nil
+pcall(function()
+  audioFocusListener = luajava.bindClass("android.media.AudioManager$OnAudioFocusChangeListener"){
+    onAudioFocusChange = function(focusChange)
+      pcall(function()
+        local isDuckingEnabled = (prefs.getInt("pref_ducking", 0) == 1)
+        if not isDuckingEnabled then return end
+
+        if focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK or focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT then
+          isFocusDucked = true
+          applyVolumeDucking()
+        elseif focusChange == AudioManager.AUDIOFOCUS_GAIN then
+          isFocusDucked = false
+          applyVolumeDucking()
+        end
+      end)
+    end
+  }
+end)
 
 -- ============================================================================
 -- FITUR PERIKSA & UNDUH OTOMATIS PEMBARUAN (MURNI LUA STRING BUFFER)
@@ -100,7 +140,6 @@ local function isVersionNewer(remote, localVer)
   return false
 end
 
--- Memasang pembaruan langsung ke berkas aktif
 local function applyScriptUpdate(newCodeContent, newVersionStr)
   local currentScriptPath = nil
   pcall(function()
@@ -528,7 +567,7 @@ local function showStreamDialog(txtFolderInfo, txtSongTitle)
     onClick = function(d, w)
       local url = tostring(edit.getText()):gsub("%s+", "")
       if url ~= "" then
-        playTrack(url)
+        playTrack(url, 0)
         currentFolderName = "Streaming Daring"
         if txtFolderInfo then txtFolderInfo.setText("Sumber: Daring") end
         if txtSongTitle then txtSongTitle.setText("Stream: " .. url) end
@@ -545,7 +584,7 @@ end
 local function showAboutDialog()
   local b = AlertDialog.Builder(service)
   b.setTitle("Tentang Aplikasi")
-  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, transisi Gapless JetAudio, Audio FX, dan pembaruan GitHub anti-timeout.")
+  b.setMessage("Pemutar Musik Folder Jieshuo+\nVersi: " .. APP_VERSION .. "\n\nFitur lengkap dengan pemutar folder, kontrol navigasi ringkas, acak khusus dalam folder, resume lagu terakhir, transisi Gapless JetAudio, Audio Ducking saat bicara/rekam, Audio FX, dan pembaruan GitHub anti-timeout.")
   b.setPositiveButton("Tutup", nil)
   local dlg = b.create()
   dlg.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
@@ -566,8 +605,9 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
   box.setOrientation(LinearLayout.VERTICAL)
   box.setPadding(35, 20, 35, 25)
 
-  local optShuffle = {"Mati", "Hidup"}
+  local optShuffle = {"Mati", "Acak Folder Saja", "Acak Semua Lagu"}
   local optRepeat = {"Mati", "Ulangi Lagu Ini", "Ulangi Folder Ini"}
+  local optResume = {"Mati", "Hidup"}
   local optSpeed = {"0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x"}
   local optDuration = {"5 Detik", "10 Detik", "15 Detik", "30 Detik"}
   local optSleep = {"Mati", "10 Menit", "15 Menit", "30 Menit", "45 Menit", "60 Menit"}
@@ -577,7 +617,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
   local optCrossfade = {"Mati", "Hidup"}
   local optCrossfadeDur = {"3 Detik", "5 Detik", "8 Detik", "10 Detik", "12 Detik", "15 Detik"}
   local optTheme = {"Terang", "Gelap", "Ikuti Sistem"}
-  local optDucking = {"Hidup", "Mati"}
+  local optDucking = {"Mati", "Hidup"}
 
   local spinners = {}
 
@@ -600,6 +640,8 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
 
   addSettingSpinner("Acak (Shuffle):", optShuffle, "pref_shuffle", 0)
   addSettingSpinner("Pengulangan (Repeat):", optRepeat, "pref_repeat", 0)
+  addSettingSpinner("Lanjutkan Posisi Terakhir (Resume):", optResume, "pref_resume", 1)
+  addSettingSpinner("Peredam Audio saat Bicara & Rekam (Ducking):", optDucking, "pref_ducking", 0)
   addSettingSpinner("Kecepatan Putar (Playback Speed):", optSpeed, "pref_speed", 2)
   addSettingSpinner("Durasi Mundur / Maju:", optDuration, "pref_seek_step", 1)
   addSettingSpinner("Pengatur Waktu Tidur (Sleep Timer):", optSleep, "pref_sleep_timer", 0)
@@ -609,7 +651,6 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
   addSettingSpinner("Transisi Mulus (Crossfade):", optCrossfade, "pref_crossfade", 1)
   addSettingSpinner("Durasi Crossfade:", optCrossfadeDur, "pref_crossfade_dur", 4)
   addSettingSpinner("Tema Tampilan (Theme):", optTheme, "pref_theme", 0)
-  addSettingSpinner("Peredam Audio saat Bicara (Speech Ducking):", optDucking, "pref_ducking", 0)
 
   local dlg = nil
 
@@ -661,6 +702,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFolderInfo, txtSongTitle
         ed.putInt(k, data.spinner.getSelectedItemPosition())
       end
       ed.apply()
+      applyVolumeDucking()
       if dlg then dlg.dismiss() end
       if onSettingsUpdated then onSettingsUpdated() end
       pcall(function() service.speak("Pengaturan disimpan.") end)
@@ -746,7 +788,7 @@ btnNext.setTextSize(11)
 
 rowPlayback.addView(btnPrev, makeColLp(1.0))
 rowPlayback.addView(btnRewind, makeColLp(1.0))
-rowPlayback.addView(btnPlay, makeColLp(1.2)) -- Tombol putar di tengah
+rowPlayback.addView(btnPlay, makeColLp(1.2))
 rowPlayback.addView(btnForward, makeColLp(1.0))
 rowPlayback.addView(btnNext, makeColLp(1.0))
 container.addView(rowPlayback)
@@ -889,19 +931,31 @@ local function applySleepTimer()
   end
 end
 
--- Aturan Pengulangan: 0 = Mati, 1 = Ulangi Lagu Ini, 2 = Ulangi Folder Ini
+-- Aturan Pengulangan & Acak (0: Mati, 1: Acak Folder Saja, 2: Acak Semua Lagu)
 local function getNextTrackIndex()
   if #filteredSongs == 0 then return -1 end
   local repeatMode = prefs.getInt("pref_repeat", 0)
-  local isShuffle = prefs.getInt("pref_shuffle", 0) == 1
+  local shuffleMode = prefs.getInt("pref_shuffle", 0)
 
   if repeatMode == 1 then
     return currentIndex
-  elseif isShuffle and #filteredSongs > 1 then
+  elseif shuffleMode == 1 and #filteredSongs > 1 then
+    -- ACAK DI DALAM FOLDER SAJA
     local r = math.random(1, #filteredSongs)
     if r == currentIndex and #filteredSongs > 1 then
       r = (currentIndex % #filteredSongs) + 1
     end
+    return r
+  elseif shuffleMode == 2 and #songList > 1 then
+    -- ACAK SEMUA LAGU (LINTAS FOLDER)
+    local r = math.random(1, #songList)
+    local targetSong = songList[r]
+    for i, p in ipairs(filteredSongs) do
+      if p == targetSong then return i end
+    end
+    filteredSongs = songList
+    currentFolderName = "Semua Lagu"
+    txtFolderInfo.setText("Folder: Semua Lagu")
     return r
   elseif currentIndex < #filteredSongs then
     return currentIndex + 1
@@ -945,6 +999,9 @@ attachCompletionListener = function(player)
   player.setOnCompletionListener(luajava.bindClass("android.media.MediaPlayer$OnCompletionListener"){
     onCompletion = function(mp)
       pcall(function()
+        -- Reset posisi resume lagu saat lagu selesai diputar normal
+        prefs.edit().putInt("last_played_pos", 0).apply()
+
         local nextIdx = tonumber(sysProps.get("GLOBAL_ADV_NEXT_INDEX") or "-1")
         if nextMediaPlayer and nextIdx and nextIdx > 0 and filteredSongs[nextIdx] then
           pcall(function() mp.release() end)
@@ -960,13 +1017,14 @@ attachCompletionListener = function(player)
 
           txtSongTitle.setText(File(currentSongPath).getName())
           applyPitchAndSpeed()
+          applyVolumeDucking()
           attachCompletionListener(mediaPlayer)
           prepareNextTrackGapless()
         else
           local nIdx = getNextTrackIndex()
           if nIdx > 0 and filteredSongs[nIdx] then
             currentIndex = nIdx
-            playTrack(filteredSongs[currentIndex])
+            playTrack(filteredSongs[currentIndex], 0)
           else
             isPlaying = false
             btnPlay.setText("PUTAR")
@@ -977,7 +1035,7 @@ attachCompletionListener = function(player)
   })
 end
 
-playTrack = function(path)
+playTrack = function(path, startMs)
   pcall(function()
     if nextMediaPlayer then
       pcall(function() nextMediaPlayer.release() end)
@@ -993,9 +1051,21 @@ playTrack = function(path)
     mediaPlayer = MediaPlayer()
     mediaPlayer.setDataSource(path)
     mediaPlayer.prepare()
+
+    -- Lanjutkan dari posisi terakhir jika parameter startMs ada
+    if startMs and startMs > 0 then
+      pcall(function() mediaPlayer.seekTo(startMs) end)
+    end
+
     mediaPlayer.start()
     isPlaying = true
     btnPlay.setText("JEDA")
+
+    pcall(function()
+      if audioManager and audioFocusListener then
+        audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+      end
+    end)
 
     currentSongPath = path
     local f = File(path)
@@ -1010,10 +1080,19 @@ playTrack = function(path)
     sysProps.put("GLOBAL_ADV_MEDIA_PLAYER", mediaPlayer)
     sysProps.put("GLOBAL_ADV_SONG_PATH", path)
     sysProps.put("GLOBAL_ADV_SONG_INDEX", tostring(currentIndex))
-    prefs.edit().putString("last_played_path", path).apply()
+    
+    local ed = prefs.edit()
+    ed.putString("last_played_path", path)
+    if startMs and startMs > 0 then
+      ed.putInt("last_played_pos", startMs)
+    else
+      ed.putInt("last_played_pos", 0)
+    end
+    ed.apply()
 
     applyPitchAndSpeed()
     applySleepTimer()
+    applyVolumeDucking()
     attachCompletionListener(mediaPlayer)
     prepareNextTrackGapless()
   end)
@@ -1046,6 +1125,7 @@ pcall(function()
           if dur > 0 then
             local targetMs = math.floor((sb.getProgress() / 100) * dur)
             mediaPlayer.seekTo(targetMs)
+            prefs.edit().putInt("last_played_pos", targetMs).apply()
             service.speak("Posisi " .. sb.getProgress() .. "% (" .. formatTime(targetMs) .. ")")
           end
         end
@@ -1054,7 +1134,7 @@ pcall(function()
   })
 end)
 
--- Pembaruan Tampilan Real-Time
+-- Pembaruan Tampilan Real-Time & Perekam Posisi Terakhir (Resume Tracker)
 local isDialogActive = true
 local updateTimerRunnable = nil
 updateTimerRunnable = Runnable{
@@ -1070,8 +1150,29 @@ updateTimerRunnable = Runnable{
           sbProgress.setProgress(math.floor((pos * 100) / dur))
         end
 
+        -- Simpan posisi putar secara otomatis setiap saat untuk fitur resume
+        if not isUserSeeking and pos > 1000 and (dur - pos > 1500) then
+          prefs.edit().putInt("last_played_pos", pos).apply()
+        end
+
         if isLoopingAB and loopB > loopA and pos >= loopB then
           mediaPlayer.seekTo(loopA)
+        end
+
+        -- Deteksi rekaman VN WhatsApp
+        if Build.VERSION.SDK_INT >= 24 and audioManager then
+          local isDuckingEnabled = (prefs.getInt("pref_ducking", 0) == 1)
+          if isDuckingEnabled then
+            local configs = audioManager.getActiveRecordingConfigurations()
+            local isRec = (configs and configs.size() > 0)
+            if isRec ~= isRecordingDucked then
+              isRecordingDucked = isRec
+              applyVolumeDucking()
+            end
+          elseif isRecordingDucked then
+            isRecordingDucked = false
+            applyVolumeDucking()
+          end
         end
       end
     end)
@@ -1102,6 +1203,7 @@ local function syncRunningPlayer()
       end
       attachCompletionListener(mediaPlayer)
       prepareNextTrackGapless()
+      applyVolumeDucking()
     end
   end)
 end
@@ -1112,9 +1214,24 @@ end
 btnPlay.setOnClickListener(View.OnClickListener{
   onClick = function(v)
     if not mediaPlayer then
-      if #filteredSongs > 0 then
+      local isResumeActive = (prefs.getInt("pref_resume", 1) == 1)
+      local lastPath = prefs.getString("last_played_path", "")
+      local lastPos = prefs.getInt("last_played_pos", 0)
+
+      -- Fitur Lanjutkan Lagu & Posisi Terakhir
+      if isResumeActive and lastPath ~= "" and File(lastPath).exists() then
+        local foundIdx = 1
+        for idx, p in ipairs(filteredSongs) do
+          if p == lastPath then foundIdx = idx; break end
+        end
+        currentIndex = foundIdx
+        playTrack(lastPath, lastPos)
+        if lastPos > 0 then
+          pcall(function() service.speak("Melanjutkan lagu dari posisi " .. formatTime(lastPos)) end)
+        end
+      elseif #filteredSongs > 0 then
         currentIndex = 1
-        playTrack(filteredSongs[currentIndex])
+        playTrack(filteredSongs[currentIndex], 0)
       else
         pcall(function() service.speak("Daftar lagu kosong. Pindai musik terlebih dahulu.") end)
       end
@@ -1125,12 +1242,24 @@ btnPlay.setOnClickListener(View.OnClickListener{
       mediaPlayer.pause()
       btnPlay.setText("PUTAR")
       isPlaying = false
-      pcall(function() service.speak("Musik dijeda.") end)
+      pcall(function()
+        prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply()
+        if audioManager and audioFocusListener then
+          audioManager.abandonAudioFocus(audioFocusListener)
+        end
+        service.speak("Musik dijeda.")
+      end)
     else
       mediaPlayer.start()
       btnPlay.setText("JEDA")
       isPlaying = true
-      pcall(function() service.speak("Musik dilanjutkan.") end)
+      pcall(function()
+        if audioManager and audioFocusListener then
+          audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+        end
+        applyVolumeDucking()
+        service.speak("Musik dilanjutkan.")
+      end)
     end
   end
 })
@@ -1139,7 +1268,7 @@ btnPrev.setOnClickListener(View.OnClickListener{
   onClick = function(v)
     if #filteredSongs > 0 and currentIndex > 1 then
       currentIndex = currentIndex - 1
-      playTrack(filteredSongs[currentIndex])
+      playTrack(filteredSongs[currentIndex], 0)
     end
   end
 })
@@ -1149,7 +1278,7 @@ btnNext.setOnClickListener(View.OnClickListener{
     local nIdx = getNextTrackIndex()
     if nIdx > 0 and filteredSongs[nIdx] then
       currentIndex = nIdx
-      playTrack(filteredSongs[currentIndex])
+      playTrack(filteredSongs[currentIndex], 0)
     end
   end
 })
@@ -1161,6 +1290,7 @@ btnRewind.setOnClickListener(View.OnClickListener{
         local step = getSeekStepMs()
         local p = math.max(0, mediaPlayer.getCurrentPosition() - step)
         mediaPlayer.seekTo(p)
+        prefs.edit().putInt("last_played_pos", p).apply()
       end
     end)
   end
@@ -1173,6 +1303,7 @@ btnForward.setOnClickListener(View.OnClickListener{
         local step = getSeekStepMs()
         local p = math.min(mediaPlayer.getDuration(), mediaPlayer.getCurrentPosition() + step)
         mediaPlayer.seekTo(p)
+        prefs.edit().putInt("last_played_pos", p).apply()
       end
     end)
   end
@@ -1216,10 +1347,10 @@ local function openFolderDialog()
             txtFolderInfo.setText("Folder: " .. currentFolderName)
             if whichSub == 0 then
               currentIndex = 1
-              playTrack(filteredSongs[1])
+              playTrack(filteredSongs[1], 0)
             else
               currentIndex = whichSub
-              playTrack(filteredSongs[currentIndex])
+              playTrack(filteredSongs[currentIndex], 0)
             end
           end
         })
@@ -1253,7 +1384,7 @@ btnSongList.setOnClickListener(View.OnClickListener{
     b.setItems(titles, DialogInterface.OnClickListener{
       onClick = function(d, which)
         currentIndex = which + 1
-        playTrack(filteredSongs[currentIndex])
+        playTrack(filteredSongs[currentIndex], 0)
       end
     })
     b.setNegativeButton("Tutup", nil)
@@ -1327,8 +1458,12 @@ btnLibrary.setOnClickListener(View.OnClickListener{
           openFolderDialog()
         elseif which == 1 then
           local last = prefs.getString("last_played_path", "")
+          local lastPos = prefs.getInt("last_played_pos", 0)
           if last ~= "" and File(last).exists() then
-            playTrack(last)
+            playTrack(last, lastPos)
+            if lastPos > 0 then
+              pcall(function() service.speak("Melanjutkan dari posisi " .. formatTime(lastPos)) end)
+            end
           else
             pcall(function() service.speak("Tidak ada data lagu terakhir.") end)
           end
@@ -1352,7 +1487,7 @@ btnLibrary.setOnClickListener(View.OnClickListener{
               currentIndex = w2 + 1
               currentFolderName = "Favorit"
               txtFolderInfo.setText("Folder: Favorit")
-              playTrack(filteredSongs[currentIndex])
+              playTrack(filteredSongs[currentIndex], 0)
             end
           })
           local dlgFav = bFav.create()
@@ -1376,6 +1511,7 @@ btnSettings.setOnClickListener(View.OnClickListener{
       applySleepTimer()
       updateRepeatButtonUI()
       prepareNextTrackGapless()
+      applyVolumeDucking()
     end, txtFolderInfo, txtSongTitle)
   end
 })
@@ -1392,11 +1528,15 @@ btnExit.setOnClickListener(View.OnClickListener{
   onClick = function(v)
     isDialogActive = false
     pcall(function()
+      if audioManager and audioFocusListener then
+        audioManager.abandonAudioFocus(audioFocusListener)
+      end
       if nextMediaPlayer then
         pcall(function() nextMediaPlayer.release() end)
         nextMediaPlayer = nil
       end
       if mediaPlayer then
+        prefs.edit().putInt("last_played_pos", mediaPlayer.getCurrentPosition()).apply()
         mediaPlayer.stop()
         mediaPlayer.release()
         mediaPlayer = nil
