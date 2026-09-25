@@ -9,6 +9,9 @@ import "android.provider.MediaStore"
 import "android.media.MediaPlayer"
 import "android.media.PlaybackParams"
 import "android.media.AudioManager"
+import "android.media.audiofx.Equalizer"
+import "android.media.audiofx.BassBoost"
+import "android.media.audiofx.PresetReverb"
 import "java.io.*"
 import "java.net.URL"
 import "java.net.HttpURLConnection"
@@ -18,7 +21,7 @@ import "java.lang.reflect.Array"
 import "java.lang.System"
 import "android.content.ClipData"
 
-local APP_VERSION = "1.0.8"
+local APP_VERSION = "1.0.10"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Pemutar-musik/main/Musicplayer.lua"
 
 local mainHandler = Handler(Looper.getMainLooper())
@@ -53,6 +56,11 @@ local mainDialog = nil
 -- Status Ducking (Peredam Audio)
 local isFocusDucked = false
 local isRecordingDucked = false
+
+-- Status Efek Audio (Equalizer, Bass Boost, Echo) - diikat ke sesi audio pemutar yang sedang aktif
+local audioEqualizer = nil
+local audioBassBoost = nil
+local audioReverb = nil
 
 -- Format Milidetik ke MM:SS
 local function formatTime(ms)
@@ -102,6 +110,126 @@ pcall(function()
     end
   }
 end)
+
+-- ============================================================================
+-- PENGATUR EFEK AUDIO (EQUALIZER, BASS BOOST, ECHO/GEMA)
+-- ============================================================================
+
+-- Kurva Equalizer per genre: {Bas, Tengah, Treble} dalam dB, diinterpolasi ke jumlah band
+-- yang benar-benar tersedia di perangkat (bisa berbeda-beda tiap HP).
+-- Urutan harus sama dengan optEqualizer: Normal, Hip Hop, Rock, Pop, Jazz, Klasik
+local eqGenreCurves = {
+  {0, 0, 0},     -- Normal (datar, tanpa efek)
+  {7, 2, -3},    -- Hip Hop (bas kuat, treble diredam)
+  {6, -1, 4},    -- Rock (bas & treble kuat, tengah sedikit turun)
+  {-2, 3, 3},    -- Pop (tengah & treble ditonjolkan)
+  {3, 2, 1},     -- Jazz (bas hangat, treble halus)
+  {2, 0, -1},    -- Klasik (natural, sedikit bas)
+}
+
+local function applyEqualizerCurve(eq, presetIndex)
+  local curve = eqGenreCurves[presetIndex + 1] or eqGenreCurves[1]
+  local lowDb, midDb, highDb = curve[1], curve[2], curve[3]
+
+  local numBands = 0
+  pcall(function() numBands = eq.getNumberOfBands() end)
+  if not numBands or numBands <= 0 then return end
+
+  local minLevel, maxLevel = -1500, 1500
+  pcall(function()
+    local range = eq.getBandLevelRange()
+    minLevel = range[0]
+    maxLevel = range[1]
+  end)
+
+  for b = 0, numBands - 1 do
+    local t = 0
+    if numBands > 1 then t = b / (numBands - 1) end
+    local db
+    if t <= 0.5 then
+      db = lowDb + (midDb - lowDb) * (t / 0.5)
+    else
+      db = midDb + (highDb - midDb) * ((t - 0.5) / 0.5)
+    end
+    local mb = math.floor(db * 100)
+    if mb < minLevel then mb = minLevel end
+    if mb > maxLevel then mb = maxLevel end
+    pcall(function() eq.setBandLevel(b, mb) end)
+  end
+end
+
+-- Melepas semua objek efek audio milik sesi lama (wajib sebelum membuat yang baru,
+-- juga dipanggil saat pemutar dihentikan, agar tidak membocorkan resource sistem)
+local function releaseAudioEffects()
+  pcall(function()
+    if audioEqualizer then
+      audioEqualizer.setEnabled(false)
+      audioEqualizer.release()
+    end
+  end)
+  audioEqualizer = nil
+
+  pcall(function()
+    if audioBassBoost then
+      audioBassBoost.setEnabled(false)
+      audioBassBoost.release()
+    end
+  end)
+  audioBassBoost = nil
+
+  pcall(function()
+    if audioReverb then
+      audioReverb.setEnabled(false)
+      audioReverb.release()
+    end
+  end)
+  audioReverb = nil
+end
+
+-- Menerapkan ulang nilai Equalizer/Bass Boost/Echo dari Pengaturan ke objek efek yang
+-- sudah ada (dipakai saat pengguna mengubah Pengaturan tanpa mengganti lagu)
+local function reapplyEffectSettings()
+  pcall(function()
+    if audioEqualizer then
+      local eqIdx = prefs.getInt("pref_equalizer", 0)
+      applyEqualizerCurve(audioEqualizer, eqIdx)
+      audioEqualizer.setEnabled(eqIdx ~= 0)
+    end
+  end)
+
+  pcall(function()
+    if audioBassBoost then
+      local bassIdx = prefs.getInt("pref_bass", 0)
+      local strengths = {0, 300, 600, 900}
+      local strength = strengths[bassIdx + 1] or 0
+      audioBassBoost.setEnabled(bassIdx > 0)
+      audioBassBoost.setStrength(strength)
+    end
+  end)
+
+  pcall(function()
+    if audioReverb then
+      local echoIdx = prefs.getInt("pref_echo", 0)
+      -- 0=Tidak Ada, 1=Ruangan Kecil, 2=Ruangan Sedang, 3=Aula Besar
+      local presets = {0, 1, 2, 5}
+      local preset = presets[echoIdx + 1] or 0
+      audioReverb.setEnabled(echoIdx > 0)
+      pcall(function() audioReverb.setPreset(preset) end)
+    end
+  end)
+end
+
+-- Memasang efek audio baru untuk sesi audio pemutar yang baru dibuat/diganti
+local function applyAudioEffects(sessionId)
+  releaseAudioEffects()
+  if not sessionId or sessionId == 0 then return end
+
+  pcall(function() audioEqualizer = Equalizer(0, sessionId) end)
+  pcall(function() audioBassBoost = BassBoost(0, sessionId) end)
+  pcall(function() audioReverb = PresetReverb(0, sessionId) end)
+
+  reapplyEffectSettings()
+end
 
 -- ============================================================================
 -- FITUR PERIKSA & UNDUH OTOMATIS PEMBARUAN (TERUJI & AMAN)
@@ -206,11 +334,15 @@ local function checkUpdate()
       local lastErrMsg = "Koneksi waktu habis (timeout)"
       local timeStamp = tostring(System.currentTimeMillis())
 
+      -- Urutan diprioritaskan ke sumber paling akurat/segar (langsung dari GitHub) lebih dulu.
+      -- CDN pihak ketiga (jsDelivr, githack) sering menyimpan cache file selama beberapa jam,
+      -- sehingga jika dicoba lebih dulu bisa salah menyimpulkan "sudah versi terbaru" padahal belum.
+      -- CDN tetap disertakan sebagai cadangan jika koneksi langsung ke GitHub gagal/timeout.
       local urlsToTry = {
+        UPDATE_URL .. "?t=" .. timeStamp,
         "https://fastly.jsdelivr.net/gh/novanblind/Pemutar-musik@main/Musicplayer.lua?t=" .. timeStamp,
         "https://cdn.jsdelivr.net/gh/novanblind/Pemutar-musik@main/Musicplayer.lua?t=" .. timeStamp,
-        "https://raw.githack.com/novanblind/Pemutar-musik/main/Musicplayer.lua?t=" .. timeStamp,
-        UPDATE_URL .. "?t=" .. timeStamp
+        "https://raw.githack.com/novanblind/Pemutar-musik/main/Musicplayer.lua?t=" .. timeStamp
       }
 
       for _, u in ipairs(urlsToTry) do
@@ -689,7 +821,7 @@ local function showSettingsDialog(onSettingsUpdated, txtFInfo, txtSTitle)
   addSettingSpinner("Kecepatan Putar (Playback Speed):", optSpeed, "pref_speed", 2)
   addSettingSpinner("Durasi Mundur / Maju:", optDuration, "pref_seek_step", 1)
   addSettingSpinner("Pengatur Waktu Tidur (Sleep Timer):", optSleep, "pref_sleep_timer", 0)
-  addSettingSpinner("Equalizer:", optEqualizer, "pref_equalizer", 1)
+  addSettingSpinner("Equalizer:", optEqualizer, "pref_equalizer", 0)
   addSettingSpinner("Efek Gema / Ruang (Echo Sound):", optEcho, "pref_echo", 0)
   addSettingSpinner("Penguat Bass (Bass Boost):", optBass, "pref_bass", 0)
   addSettingSpinner("Transisi Mulus (Crossfade):", optCrossfade, "pref_crossfade", 1)
@@ -1074,6 +1206,27 @@ end
 
 local attachCompletionListener = nil
 
+-- Menuntaskan crossfade yang sedang berjalan secara instan (dipakai saat pengguna
+-- menekan Lanjut/Sebelum lagi di tengah proses fade, agar skip langsung merespons
+-- alih-alih diabaikan, seperti perilaku JetAudio saat di-skip berkali-kali cepat).
+local function finishCrossfadeImmediately()
+  if not isCrossfading then return end
+  pcall(function()
+    for _, p in ipairs(fadingOldPlayers) do
+      pcall(function() p.stop() end)
+      pcall(function() p.release() end)
+    end
+  end)
+  fadingOldPlayers = {}
+  pcall(function()
+    if mediaPlayer then
+      local maxV = getCurrentMaxVolume()
+      mediaPlayer.setVolume(maxV, maxV)
+    end
+  end)
+  isCrossfading = false
+end
+
 -- Persiapan Pemutar Lagu Berikutnya (Gapless vs Crossfade Mode)
 prepareNextTrackGapless = function()
   pcall(function()
@@ -1144,6 +1297,7 @@ attachCompletionListener = function(player)
 
             txtSongTitle.setText(File(currentSongPath).getName())
             applyPitchAndSpeed()
+            pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
             applyVolumeDucking()
             attachCompletionListener(mediaPlayer)
             prepareNextTrackGapless()
@@ -1213,6 +1367,7 @@ startCrossfadeTo = function(nextPath, nextIdx, durMs)
   ed.apply()
 
   applyPitchAndSpeed()
+  pcall(function() applyAudioEffects(newPlayer.getAudioSessionId()) end)
   applySleepTimer()
   attachCompletionListener(mediaPlayer)
 
@@ -1249,9 +1404,15 @@ playTrack = function(path, startMs, forceImmediate)
     local isStillPlaying = false
     pcall(function() isStillPlaying = mediaPlayer.isPlaying() end)
     if isStillPlaying then
+      -- Jika pengguna men-skip lagi saat crossfade sebelumnya masih berjalan,
+      -- tuntaskan dulu secara instan supaya skip berikutnya tetap responsif.
+      if isCrossfading then
+        finishCrossfadeImmediately()
+      end
+      -- Gunakan durasi crossfade sesuai Pengaturan secara konsisten,
+      -- baik untuk transisi otomatis maupun saat lagu di-skip manual (gaya JetAudio).
       local cDur = getCrossfadeDurMs()
-      local manualDur = math.min(cDur, 2500)
-      startCrossfadeTo(path, currentIndex, manualDur)
+      startCrossfadeTo(path, currentIndex, cDur)
       return
     end
   end
@@ -1318,6 +1479,7 @@ playTrack = function(path, startMs, forceImmediate)
     ed.apply()
 
     applyPitchAndSpeed()
+    pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
     applySleepTimer()
     applyVolumeDucking()
     attachCompletionListener(mediaPlayer)
@@ -1438,6 +1600,7 @@ local function syncRunningPlayer()
         txtFolderInfo.setText("Folder: " .. currentFolderName)
       end
       attachCompletionListener(mediaPlayer)
+      pcall(function() applyAudioEffects(mediaPlayer.getAudioSessionId()) end)
       prepareNextTrackGapless()
       applyVolumeDucking()
     end
@@ -1802,6 +1965,7 @@ btnSettings.setOnClickListener(View.OnClickListener{
       updateRepeatButtonUI()
       prepareNextTrackGapless()
       applyVolumeDucking()
+      reapplyEffectSettings()
     end, txtFolderInfo, txtSongTitle)
   end
 })
@@ -1840,6 +2004,7 @@ btnExit.setOnClickListener(View.OnClickListener{
       sysProps.remove("GLOBAL_ADV_SONG_INDEX")
       sysProps.remove("GLOBAL_ADV_NEXT_INDEX")
       cancelSleepTimer()
+      releaseAudioEffects()
       service.speak("Pemutar musik dihentikan dan ditutup.")
     end)
     mainDialog.dismiss()
